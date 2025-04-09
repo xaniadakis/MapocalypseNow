@@ -1,0 +1,9 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+.idea
+assets/
+/venv/
+/best_model.pth
+*.pth
+/src/temp/
+/data/
