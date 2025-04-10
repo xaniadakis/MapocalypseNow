@@ -19,6 +19,9 @@ data_dir = cwd.parent / "data"
 processed_dir = data_dir / "processed"
 ref_path = processed_dir / "GBDA24_ex2_ref_data_reprojected.tif"
 
+dataset_dir = data_dir / "patch_dataset"
+mask_dir = dataset_dir / "masks"
+mask_paths = sorted(mask_dir.glob("mask_*.tif"))
 
 SPLIT_RATIOS = (0.7, 0.2, 0.1)
 SEED = 42
@@ -73,77 +76,6 @@ def create_split_files():
 
     print(f"Split complete: {len(train_ids)} train | {len(val_ids)} val | {len(test_ids)} test.")
     print(f"Total dataset size: {len(train_ids)+len(val_ids)+len(test_ids)} patches.")
-
-def plot_split_grid():
-    with rasterio.open(ref_path) as src:
-        nodata = src.nodata
-        valid_mask = src.read(1) != nodata
-        height, width = src.height, src.width
-
-    row_count = 0
-    col_count = 0
-    patch_idx = 0
-    valid_patch_indices = []
-
-    for row in range(0, height, PATCH_SIZE):
-        col_valid = 0
-        for col in range(0, width, PATCH_SIZE):
-            window = Window(col, row,
-                            min(PATCH_SIZE, width - col),
-                            min(PATCH_SIZE, height - row))
-            patch = valid_mask[
-                int(window.row_off):int(window.row_off + window.height),
-                int(window.col_off):int(window.col_off + window.width)
-            ]
-            if patch.any():
-                valid_patch_indices.append((row_count, col_valid, patch_idx))
-                col_valid += 1
-            patch_idx += 1
-        if col_valid > 0:
-            row_count += 1
-            col_count = max(col_count, col_valid)
-
-    print(f"Grid size (valid patches): {row_count} rows x {col_count} cols")
-
-    # Load split IDs
-    def load_ids(path): return set(open(path).read().splitlines())
-    train_ids = load_ids(SPLIT_DIR / "train.txt")
-    val_ids = load_ids(SPLIT_DIR / "val.txt")
-    test_ids = load_ids(SPLIT_DIR / "test.txt")
-
-    id_lookup = {**{i: "train" for i in train_ids},
-                 **{i: "val" for i in val_ids},
-                 **{i: "test" for i in test_ids}}
-
-    patch_grid = np.zeros((row_count, col_count), dtype=np.uint8)
-    color_map = {"train": 1, "val": 2, "test": 3}
-
-    for row_idx, col_idx, patch_idx in valid_patch_indices:
-        patch_id = str(patch_idx)
-        if patch_id in id_lookup:
-            patch_grid[row_idx, col_idx] = color_map[id_lookup[patch_id]]
-
-    # Create RGB image
-    img = np.zeros((*patch_grid.shape, 3), dtype=np.uint8)
-    img[patch_grid == 1] = [66, 133, 244]     # blue (train)
-    img[patch_grid == 2] = [255, 165, 0]      # orange (val)
-    img[patch_grid == 3] = [52, 168, 83]      # green (test)
-
-    # Plot
-    plt.figure(figsize=(10, 10))
-    plt.imshow(img)
-    plt.title("Dataset Split Grid")
-    plt.axis("off")
-
-    legend_patches = [
-        mpatches.Patch(color='blue', label='Train'),
-        mpatches.Patch(color='orange', label='Val'),
-        mpatches.Patch(color='green', label='Test')
-    ]
-    plt.legend(handles=legend_patches, loc="lower center", bbox_to_anchor=(0.5, -0.05), ncol=3)
-    plt.tight_layout()
-    plt.savefig(assets_dir / "dataset_split_grid.png")
-    plt.show()
 
 class Sentinel2Dataset(Dataset):
     def __init__(self, split_txt, patch_dir, transform=None, downsample_size=256):
@@ -311,7 +243,94 @@ if __name__ == "__main__":
     # print("Means:", means)
     # print("Stds: ", stds)
 
-    plot_split_grid()
+    # === Create low-res mask grid plot ===
+    print("\nBuilding downsampled mask grid...")
+    # Plot whole grid
+    with rasterio.open(ref_path) as src:
+        data = src.read(1)
+        nodata = src.nodata
+        height, width = src.height, src.width
+    valid_mask = data != nodata
+    patch_count = 0
+    row_count = 0
+    col_count = 0
+    for row_idx, row in enumerate(range(0, height, PATCH_SIZE)):
+        col_valid = 0
+        for col_idx, col in enumerate(range(0, width, PATCH_SIZE)):
+            window = Window(col, row,
+                            min(PATCH_SIZE, width - col),
+                            min(PATCH_SIZE, height - row))
+            patch = valid_mask[
+                    int(window.row_off):int(window.row_off + window.height),
+                    int(window.col_off):int(window.col_off + window.width)
+                    ]
+            if patch.any():
+                patch_count += 1
+                col_valid += 1
+        if col_valid > 0:
+            row_count += 1
+            col_count = max(col_count, col_valid)
+    print(f"Total valid patches: {patch_count}")
+    print(f"Grid size: {row_count} rows × {col_count} cols")
+    # Load and resize masks
+    target_size = 16
+    masks = []
+    for path in mask_paths:
+        with rasterio.open(path) as src:
+            m = src.read(1)
+        m_ds = cv2.resize(m, (target_size, target_size), interpolation=cv2.INTER_NEAREST)
+        masks.append(m_ds)
+
+    print(f"Rows: {row_count}, Cols: {col_count}")
+
+    # Create canvas
+    canvas_rgb = np.zeros((row_count * target_size, col_count * target_size, 3), dtype=np.uint8)
+
+    # Load split IDs
+    train_ids = set(open(SPLIT_DIR / "train.txt").read().splitlines())
+    val_ids = set(open(SPLIT_DIR / "val.txt").read().splitlines())
+    test_ids = set(open(SPLIT_DIR / "test.txt").read().splitlines())
+
+    color_map = {
+        "train": [66, 133, 244],  # blue
+        "val": [255, 165, 0],  # orange
+        "test": [52, 168, 83]  # green
+    }
+
+    # Place each resized mask into its proper grid cell
+    for path_idx, (path, mask) in enumerate(zip(mask_paths, masks)):
+        patch_id = path.stem.replace("mask_", "")
+        idx = int(patch_id)
+        r = idx // col_count
+        c = idx % col_count
+
+        if patch_id in train_ids:
+            color = color_map["train"]
+        elif patch_id in val_ids:
+            color = color_map["val"]
+        elif patch_id in test_ids:
+            color = color_map["test"]
+        else:
+            continue  # not in any split
+
+        color_mask = np.stack([(mask == 1) * ch for ch in color], axis=-1).astype(np.uint8)
+        canvas_rgb[r * target_size:(r + 1) * target_size,
+        c * target_size:(c + 1) * target_size] = color_mask
+
+    # Show the final grid
+    plt.figure(figsize=(10, 10))
+    plt.imshow(canvas_rgb)
+    plt.title("Split Overlay on Downsampled Mask Grid")
+    plt.axis("off")
+
+    legend_patches = [
+        mpatches.Patch(color=np.array(color_map["train"]) / 255, label='Train'),
+        mpatches.Patch(color=np.array(color_map["val"]) / 255, label='Val'),
+        mpatches.Patch(color=np.array(color_map["test"]) / 255, label='Test')
+    ]
+    plt.legend(handles=legend_patches, loc="lower center", bbox_to_anchor=(0.5, -0.05), ncol=3)
+    plt.tight_layout()
+    plt.show()
 
     # === Add after dataset splitting ===
     plot_all_split_frequencies()
@@ -319,7 +338,7 @@ if __name__ == "__main__":
     # sample = train_dataset[0]
     # print("Sample loaded:")
     # print(f"Image shape: {sample[0].shape}, Label shape: {sample[1].shape}, Mask shape: {sample[2].shape}")
-    #
+
     # for i in range(3):
     #     image, label, _ = train_dataset[0]
     #     plt.imshow(image[2], cmap="gray")

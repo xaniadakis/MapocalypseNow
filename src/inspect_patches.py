@@ -19,7 +19,10 @@ label_texts = {
         3: "Grassland",
         4: "Cropland",
         5: "Built-up",
-        6: "Bare land"
+        6: "Bare land",
+        7: "Snow/Ice",
+        8: "Water",
+        9: "Wetland",
     },
     "gr": {
         1: "Δάσος",
@@ -27,7 +30,10 @@ label_texts = {
         3: "Λιβάδια",
         4: "Καλλιέργειες",
         5: "Δόμηση",
-        6: "Γυμνή γη"
+        6: "Γυμνή γη",
+        7: "Χιόνι/Πάγος",
+        8: "Νερό",
+        9: "Yγρότοποι",
     }
 }
 label_names = label_texts[LANGUAGE]
@@ -71,6 +77,10 @@ print(f"Total masks: {len(mask_paths)}")
 print(f"Empty (all 0): {empty}")
 print(f"Full  (all 1): {full}")
 print(f"Mixed (0 + 1): {mixed}")
+
+
+
+
 # === Create low-res mask grid plot ===
 print("\nBuilding downsampled mask grid...")
 # Plot whole grid
@@ -200,10 +210,10 @@ for i in indices:
 
     bars = axes[3].bar(text_labels, percentages)
     axes[3].set_title(titles[3])
-    axes[3].set_xlabel("Label")
-    axes[3].set_ylabel("Percentage (%)")
+    axes[3].set_xlabel("Label", fontsize=8)
+    axes[3].set_ylabel("Percentage (%)", fontsize=8)
     axes[3].grid(axis="y", linestyle="--", alpha=0.5)
-    plt.setp(axes[3].get_xticklabels(), rotation=15, ha="right")
+    plt.setp(axes[3].get_xticklabels(), rotation=15, ha="right", fontsize=7)
 
     for bar, pct in zip(bars, percentages):
         axes[3].text(bar.get_x() + bar.get_width() / 2,
