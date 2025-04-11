@@ -3,7 +3,8 @@ __pycache__/
 .idea
 assets/
 /venv/
-/checkpoints/best_model.pth
+/checkpoints/initial_model.pth
 *.pth
 /src/temp/
 /data/
+/checkpoints/

@@ -2,28 +2,75 @@ import torch
 import torch.nn as nn
 from torchvision import models
 from torch.nn import functional as F
-from torchvision.models import ResNet50_Weights
+from torchvision.models import ResNet50_Weights, ResNet101_Weights, ResNet152_Weights
+
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1.0):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, preds, targets, mask):
+        preds = torch.softmax(preds, dim=1)
+        num_classes = preds.shape[1]
+
+        dice = 0.0
+        for cls in range(1, num_classes):  # skip background if index 0
+            pred_flat = preds[:, cls].contiguous().view(-1)
+            target_flat = (targets == cls).float().view(-1)
+            mask_flat = mask.view(-1)
+
+            pred_flat = pred_flat[mask_flat == 1]
+            target_flat = target_flat[mask_flat == 1]
+
+            intersection = (pred_flat * target_flat).sum()
+            union = pred_flat.sum() + target_flat.sum()
+            dice += (2. * intersection + self.smooth) / (union + self.smooth)
+
+        return 1 - dice / (num_classes - 1)
+
+
+class AttentionBlock(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 8, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 8, in_channels, 1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        attn = self.global_pool(x)
+        attn = self.fc(attn)
+        return x * attn
 
 
 class DecoderBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
+
+        self.attn = AttentionBlock(in_channels)
+
         self.block = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.2),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         )
 
+
     def forward(self, x):
         return self.block(x)
 
 
 class UNetResNet(nn.Module):
-    def __init__(self, encoder_depth=50, num_classes=10, pretrained=True):
+    def __init__(self, encoder_depth=50, num_classes=10, pretrained=True, dropout_p=0.2):
         super().__init__()
 
         # Load pre-trained ResNet as encoder
@@ -33,6 +80,12 @@ class UNetResNet(nn.Module):
         elif encoder_depth == 50:
             weights = ResNet50_Weights.DEFAULT if pretrained else None
             self.encoder = models.resnet50(weights=weights)
+            encoder_channels = [64, 256, 512, 1024, 2048]
+        elif encoder_depth == 101:
+            self.encoder = models.resnet101(weights=ResNet101_Weights.DEFAULT if pretrained else None)
+            encoder_channels = [64, 256, 512, 1024, 2048]
+        elif encoder_depth == 152:
+            self.encoder = models.resnet152(weights=ResNet152_Weights.DEFAULT if pretrained else None)
             encoder_channels = [64, 256, 512, 1024, 2048]
         else:
             raise ValueError(f"Unsupported encoder depth: {encoder_depth}")
@@ -66,6 +119,12 @@ class UNetResNet(nn.Module):
             self.encoder.layer4
         ])
 
+        # # Freeze first half of the encoder (conv1, bn1, layer1, layer2)
+        # freeze_layers = [self.encoder.conv1, self.encoder.bn1, self.encoder.layer1, self.encoder.layer2]
+        # for layer in freeze_layers:
+        #     for param in layer.parameters():
+        #         param.requires_grad = False
+
         # Decoder blocks
         decoder_channels = [256, 128, 64, 32]
         self.decoder_layers = nn.ModuleList()
@@ -86,6 +145,11 @@ class UNetResNet(nn.Module):
             #     nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
             # )
             self.final_conv = nn.Conv2d(decoder_channels[-1], num_classes, kernel_size=1)
+
+            self.final_conv = nn.Sequential(
+                nn.Dropout2d(p=dropout_p),  # new
+                nn.Conv2d(decoder_channels[-1], num_classes, kernel_size=1)
+            )
 
             # Store channels for skip connections
             self.encoder_channels = encoder_channels

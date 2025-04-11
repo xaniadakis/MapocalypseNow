@@ -7,13 +7,28 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 import random
+import tkinter as tk
+from tkinter import filedialog
+import argparse
+from tqdm import tqdm
 
 from v_prepare_training_data import Sentinel2Dataset, get_training_augmentations, PATCH_DIR, SPLIT_DIR
-from vi2_sentinel2_unet import UNetResNet
+from vi2_sentinel2_unet import UNetResNet, DiceLoss
 import os
 
 
-def train_model(model, train_dataset, val_dataset, device, hyperparams, patience=3):
+def color(text, style='bold', color='cyan'):
+    styles = {'bold': '1', 'dim': '2', 'normal': '22'}
+    colors = {'cyan': '36', 'magenta': '35', 'yellow': '33', 'blue': '34'}
+    return f"\033[{styles[style]};{colors[color]}m{text}\033[0m"
+
+
+def train_model(model, train_dataset, val_dataset, device, hyperparams, output_dir, patience=3):
+    model_path = os.path.join(output_dir, "best_model.pth")
+    log_file = os.path.join(output_dir, "training_log.txt")
+    meta_file = os.path.join(output_dir, "best_model_meta.txt")
+    plot_path = os.path.join(output_dir, "training_metrics.png")
+
     epochs_no_improve = 0
 
     # Create data loaders
@@ -31,7 +46,13 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, patience
     )
 
     # Loss and optimizer
-    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    # criterion = nn.CrossEntropyLoss(ignore_index=0)
+
+    ce_criterion = nn.CrossEntropyLoss(ignore_index=0)
+    ce_weight = 0.4
+    dice_criterion = DiceLoss()
+    dice_weight = 1-ce_weight
+
     optimizer = optim.Adam(model.parameters(), lr=hyperparams['lr'])
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=3, factor=0.5)
 
@@ -51,14 +72,16 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, patience
         train_preds = []
         train_labels = []
 
-        for images, labels, masks in train_loader:
+        # for images, labels, masks in train_loader:
+        for images, labels, masks in tqdm(train_loader, desc=f"Train Epoch {epoch + 1}", leave=False, colour="blue"):
             images = images.to(device)
             labels = labels.to(device).long()
             masks = masks.to(device)
 
             optimizer.zero_grad()
             outputs = model(images)
-            loss = criterion(outputs, labels)
+            # loss = criterion(outputs, labels)
+            loss = ce_weight * ce_criterion(outputs, labels) + dice_weight * dice_criterion(outputs, labels, masks)
             loss.backward()
             optimizer.step()
 
@@ -75,13 +98,15 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, patience
         val_labels = []
 
         with torch.no_grad():
-            for images, labels, masks in val_loader:
+            # for images, labels, masks in val_loader:
+            for images, labels, masks in tqdm(val_loader, desc=f"Val Epoch {epoch + 1}", leave=False, colour="red"):
                 images = images.to(device)
                 labels = labels.to(device).long()
                 masks = masks.to(device)
 
                 outputs = model(images)
-                loss = criterion(outputs, labels)
+                # loss = criterion(outputs, labels)
+                loss = ce_weight * ce_criterion(outputs, labels) + dice_weight * dice_criterion(outputs, labels, masks)
                 epoch_val_loss += loss.item() * images.size(0)
 
                 preds = torch.argmax(outputs, dim=1)
@@ -94,10 +119,10 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, patience
         val_loss = epoch_val_loss / len(val_loader.dataset)
 
         train_f1 = f1_score(train_labels, train_preds, average='weighted')
-        val_f1 = f1_score(val_labels, val_preds, average='weighted')
+        val_f1 = f1_score(val_labels, val_preds, average='weighted', zero_division=0)
         train_acc = np.mean(np.array(train_labels) == np.array(train_preds))
         val_acc = np.mean(np.array(val_labels) == np.array(val_preds))
-        iou = jaccard_score(val_labels, val_preds, average='weighted')
+        iou = jaccard_score(val_labels, val_preds, average='weighted', zero_division=0)
 
         # Logs
         train_loss_history.append(train_loss)
@@ -108,26 +133,55 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, patience
         val_acc_history.append(val_acc)
         iou_history.append(iou)
 
-        print(f"Epoch {epoch + 1}/{hyperparams['epochs']}")
-        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-        print(f"Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f}")
-        print(f"Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
-        print(f"IoU: {iou:.4f}")
+        print(
+            f"\n{color('Epoch', 'bold', 'magenta')} {epoch + 1}/{hyperparams['epochs']} | "
+            f"{color('Train', 'bold', 'cyan')}: "
+            f"{color('loss')} {train_loss:.4f} {color('f1')} {train_f1:.4f} {color('acc')} {train_acc:.2%} | "
+            f"{color('Val', 'bold', 'blue')}: "
+            f"{color('loss', color='blue')} {val_loss:.4f} {color('f1', color='blue')} {val_f1:.4f} "
+            f"{color('acc', color='blue')} {val_acc:.2%} {color('IoU', color='blue')} {iou:.4f}"
+        )
+        num_classes = model.final_conv[-1].out_channels
+        per_class_f1 = f1_score(val_labels, val_preds, average=None, labels=list(range(1, num_classes)), zero_division=0)
+        per_class_names = [f"Class {i}" for i in range(1, num_classes)]
+        print(color("Per-Class F1:", 'bold', 'yellow'))
+        for cls_name, f1 in zip(per_class_names, per_class_f1):
+            print(f"  {cls_name}: {f1:.4f}")
+        print("\n")
+
 
         if val_f1 > best_f1:
             best_f1 = val_f1
             epochs_no_improve = 0
-            model_path = os.path.join("checkpoints", "best_model.pth")
             torch.save(model.state_dict(), model_path)
+
+            with open(meta_file, "w") as f:
+                f.write(f"Saved at Epoch: {epoch + 1}\n")
+                f.write(f"Val F1: {val_f1:.4f}\n")
+                f.write(f"Val Acc: {val_acc:.4f}\n")
+                f.write(f"IoU: {iou:.4f}\n")
+                f.write(f"LR: {hyperparams['lr']}, Batch Size: {hyperparams['batch_size']}\n")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
                 print(f"Early stopping at epoch {epoch + 1}")
                 break
 
+        with open(log_file, "a") as f:
+            f.write(f"Epoch {epoch + 1}\n")
+            f.write(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}\n")
+            f.write(f"Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f}\n")
+            f.write(f"Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}\n")
+            f.write(f"IoU: {iou:.4f}\n")
+            f.write(f"Best F1 So Far: {best_f1:.4f}\n")
+            f.write("Per-Class F1:\n")
+            for cls_name, f1 in zip(per_class_names, per_class_f1):
+                f.write(f"{cls_name}: {f1:.4f}\n")
+            f.write("-" * 40 + "\n")
+
         scheduler.step(val_f1)
 
-    # Plot
+    # Plot training metrics
     plt.figure(figsize=(14, 5))
 
     plt.subplot(1, 3, 1)
@@ -155,7 +209,7 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, patience
     plt.legend()
 
     plt.tight_layout()
-    plt.savefig('training_metrics.png')
+    plt.savefig(plot_path)
     plt.close()
 
     return {
@@ -242,14 +296,17 @@ def visualize_prediction(model, dataset, device, idx=0):
     plt.show()
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train or Load UNet Model for Sentinel2 Segmentation")
+    parser.add_argument("--load", action="store_true", default=False, help="Load a model checkpoint instead of training")
+    parser.add_argument("--n_patches", type=int, default=5, help="Number of random patches to visualize")
+    args = parser.parse_args()
 
-    os.makedirs("checkpoints", exist_ok=True)
     # Initialize device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     print(f"DEVICE: {device}")
 
-    # Load datasets (using your previous implementation)
+    # Load datasets
     train_dataset = Sentinel2Dataset(
         split_txt=SPLIT_DIR / "train.txt",
         patch_dir=PATCH_DIR,
@@ -261,30 +318,37 @@ if __name__ == "__main__":
         transform=None
     )
 
-    model = UNetResNet(encoder_depth=50, num_classes=10).to(device)
+    model = UNetResNet(encoder_depth=101, num_classes=10).to(device)
 
-    load_model = True  # set to False to disable loading
-    model_path = os.path.join("checkpoints", "best_model.pth")
-
-    if load_model and os.path.exists(model_path):
-        print("Loading model from checkpoint...")
-        model.load_state_dict(torch.load(model_path))
+    if args.load:
+        root = tk.Tk()
+        root.withdraw()
+        model_path = filedialog.askopenfilename(
+            initialdir=os.getcwd(),
+            title="Select model checkpoint",
+            filetypes=(("PyTorch checkpoint", "*.pth"), ("All files", "*.*"))
+        )
+        root.destroy()
+        if model_path and os.path.exists(model_path):
+            print("Loading model from checkpoint...")
+            model.load_state_dict(torch.load(model_path))
+        else:
+            exit(1)
     else:
         print("Training model from scratch...")
 
-        # Train with default hyperparameters
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = os.path.join("checkpoints", run_id)
+        os.makedirs(run_dir, exist_ok=True)
+
         default_hyperparams = {
             'batch_size': 8,
             'lr': 1e-4,
             'epochs': 30
         }
-        metrics = train_model(model, train_dataset, val_dataset, device, default_hyperparams)
-
+        metrics = train_model(model, train_dataset, val_dataset, device, default_hyperparams, output_dir=run_dir)
 
     indices = random.sample(range(len(val_dataset)), 5)
     for idx in indices:
         print(f"\n=== Patch {idx} ===")
         visualize_prediction(model, val_dataset, device, idx=idx)
-
-        # Run hyperparameter experiment
-        # lr_results = run_hyperparameter_experiment(train_dataset, val_dataset, device)
