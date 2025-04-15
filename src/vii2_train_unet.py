@@ -1,3 +1,6 @@
+from pathlib import Path
+
+import rasterio
 import torch
 import torch.optim as optim
 from torch import nn
@@ -11,19 +14,85 @@ import tkinter as tk
 from tkinter import filedialog
 import argparse
 from tqdm import tqdm
-
-from v_prepare_training_data import Sentinel2Dataset, get_training_augmentations, PATCH_DIR, SPLIT_DIR
-from vi2_sentinel2_unet import UNetResNet, DiceLoss
+from torch.cuda.amp import GradScaler, autocast
+from torchmetrics.classification import MulticlassF1Score, MulticlassJaccardIndex, MulticlassAccuracy
+from v_prepare_training_data import Sentinel2Dataset, get_training_augmentations, SPLIT_DIR, label_to_text, \
+    label_to_cls, AUG_PATCH_DIR
+from vi2_sentinel2_unet import UNetResNet, DiceLoss, FocalLoss, AdaptiveLoss
 import os
+from torch.utils.data import WeightedRandomSampler
+from collections import Counter
 
+NUM_CLASSES = 9
+PATCH_SIZE = STRIDE = 512
+PATCH_DIR = Path(f"data/patch_dataset_{PATCH_SIZE}_{STRIDE}")
+OVERSAMPLE_MINORITIES = False
 
 def color(text, style='bold', color='cyan'):
     styles = {'bold': '1', 'dim': '2', 'normal': '22'}
     colors = {'cyan': '36', 'magenta': '35', 'yellow': '33', 'blue': '34'}
     return f"\033[{styles[style]};{colors[color]}m{text}\033[0m"
 
+def compute_sampler_weights(dataset, minority_classes=[2, 5, 6, 7, 8]):
+    weights = []
+    for id_ in dataset.ids:
+        lbl_path = PATCH_DIR / "labels" / f"label_{id_}.tif"
+        with rasterio.open(lbl_path) as src:
+            lbl = src.read(1)
+        weight = 1.0 + 5.0 * np.isin(lbl, minority_classes).any()
+        weights.append(weight)
+    return weights
 
-def train_model(model, train_dataset, val_dataset, device, hyperparams, output_dir, patience=3):
+def get_pixel_class_distribution(dataset, patch_dir, num_classes, label_to_cls):
+    total_counts = np.zeros(num_classes)
+    for id_ in dataset.ids:
+        lbl_path = patch_dir / "labels" / f"label_{id_}.tif"
+        with rasterio.open(lbl_path) as src:
+            lbl = src.read(1)
+        unique, counts = np.unique(lbl, return_counts=True)
+        for raw_label, count in zip(unique, counts):
+            if raw_label in label_to_cls:
+                cls_idx = label_to_cls[raw_label]
+                total_counts[cls_idx] += count
+    return total_counts
+
+def compute_pixel_based_patch_weights(dataset, patch_dir, label_to_cls, num_classes):
+    class_pixel_counts = np.zeros(num_classes)
+    patch_weights = []
+
+    for id_ in dataset.ids:
+        lbl_path = patch_dir / "labels" / f"label_{id_}.tif"
+        with rasterio.open(lbl_path) as src:
+            lbl = src.read(1)
+
+        patch_class_counts = np.zeros(num_classes)
+        for raw_label in np.unique(lbl):
+            if raw_label in label_to_cls:
+                cls_idx = label_to_cls[raw_label]
+                count = np.sum(lbl == raw_label)
+                patch_class_counts[cls_idx] += count
+
+        class_pixel_counts += patch_class_counts
+        patch_weights.append(patch_class_counts)
+
+    class_freq = class_pixel_counts / class_pixel_counts.sum()
+    class_weights = 1.0 / (class_freq + 1e-6)
+
+    weights = []
+    for patch_dist in patch_weights:
+        patch_weight = np.dot(patch_dist, class_weights)
+        weights.append(patch_weight)
+
+    return weights
+
+# test-time augmentation
+def tta_predict(model, x):
+    preds = model(x)
+    preds_flipped = model(torch.flip(x, dims=[3]))
+    preds_flipped = torch.flip(preds_flipped, dims=[3])
+    return (preds + preds_flipped) / 2
+
+def train_model(model, train_dataset, val_dataset, device, hyperparams, output_dir, early_patience=3):
     model_path = os.path.join(output_dir, "best_model.pth")
     log_file = os.path.join(output_dir, "training_log.txt")
     meta_file = os.path.join(output_dir, "best_model_meta.txt")
@@ -31,11 +100,17 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
 
     epochs_no_improve = 0
 
-    # Create data loaders
+    patch_weights = compute_pixel_based_patch_weights(train_dataset, PATCH_DIR, label_to_cls, NUM_CLASSES)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=hyperparams['batch_size'],
-        shuffle=True,
+        sampler=(
+            WeightedRandomSampler(patch_weights, len(patch_weights), replacement=True)
+            if OVERSAMPLE_MINORITIES
+            else None
+        ),
+        shuffle=not OVERSAMPLE_MINORITIES,
         num_workers=4
     )
     val_loader = DataLoader(
@@ -45,16 +120,38 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
         num_workers=4
     )
 
+    dist = get_pixel_class_distribution(train_dataset, PATCH_DIR, NUM_CLASSES, label_to_cls)
+    print("Pixel count per class:", dist.astype(int))
+
+    f1_metric = MulticlassF1Score(num_classes=NUM_CLASSES, average='weighted', ignore_index=0).to(device)
+    iou_metric = MulticlassJaccardIndex(num_classes=NUM_CLASSES, average='weighted', ignore_index=0).to(device)
+    acc_metric = MulticlassAccuracy(num_classes=NUM_CLASSES, average='micro', ignore_index=0).to(device)
+
     # Loss and optimizer
     # criterion = nn.CrossEntropyLoss(ignore_index=0)
 
-    ce_criterion = nn.CrossEntropyLoss(ignore_index=0)
-    ce_weight = 0.4
-    dice_criterion = DiceLoss()
-    dice_weight = 1-ce_weight
+    # # increase if you get good IoU but misclassified pixels
+    # ce_weight = 0.2
+    # # increase if segment shapes are off or fragmented
+    # dice_weight = 0.5
+    # # increase if you get high training accuracy but poor generalization
+    # focal_weight = 1 - ce_weight - dice_weight
+    #
+    # # focuses on hard examples
+    # focal_criterion = FocalLoss()
+    # # pixel-wise classification loss, strong baseline, handles class imbalance if ignore_index/weights are used
 
-    optimizer = optim.Adam(model.parameters(), lr=hyperparams['lr'])
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=3, factor=0.5)
+    weights = 1.0 / (dist + 1e-6)  # Avoid div by zero
+    weights /= weights.sum()  # Normalize to sum to 1
+    class_weights = torch.tensor(weights, dtype=torch.float32).to(device)
+    ce_criterion = nn.CrossEntropyLoss(ignore_index=0, weight=class_weights.to(device))
+    # ce_criterion = nn.CrossEntropyLoss(ignore_index=0)
+    # overlap-based, class-agnostic, good for segmentation accuracy
+    # dice_criterion = DiceLoss()
+    adaptive_loss = AdaptiveLoss(class_weights=class_weights.to(device), num_classes=NUM_CLASSES).to(device)
+
+    optimizer = optim.AdamW(model.parameters(), lr=hyperparams['lr'], weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=2, factor=0.5)
 
     # Histories
     best_f1 = 0.0
@@ -71,19 +168,23 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
         epoch_train_loss = 0.0
         train_preds = []
         train_labels = []
+        # scaler = torch.amp.GradScaler('cuda') # GradScaler()
 
-        # for images, labels, masks in train_loader:
         for images, labels, masks in tqdm(train_loader, desc=f"Train Epoch {epoch + 1}", leave=False, colour="blue"):
             images = images.to(device)
             labels = labels.to(device).long()
             masks = masks.to(device)
 
             optimizer.zero_grad()
+            # with torch.amp.autocast('cuda'): # autocast():
             outputs = model(images)
             # loss = criterion(outputs, labels)
-            loss = ce_weight * ce_criterion(outputs, labels) + dice_weight * dice_criterion(outputs, labels, masks)
+            loss = adaptive_loss(outputs, labels, masks)
             loss.backward()
             optimizer.step()
+            # scaler.scale(loss).backward()
+            # scaler.step(optimizer)
+            # scaler.update()
 
             epoch_train_loss += loss.item() * images.size(0)
 
@@ -98,15 +199,15 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
         val_labels = []
 
         with torch.no_grad():
-            # for images, labels, masks in val_loader:
             for images, labels, masks in tqdm(val_loader, desc=f"Val Epoch {epoch + 1}", leave=False, colour="red"):
                 images = images.to(device)
                 labels = labels.to(device).long()
                 masks = masks.to(device)
 
                 outputs = model(images)
+                # outputs = tta_predict(model, images)
                 # loss = criterion(outputs, labels)
-                loss = ce_weight * ce_criterion(outputs, labels) + dice_weight * dice_criterion(outputs, labels, masks)
+                loss = adaptive_loss(outputs, labels, masks)
                 epoch_val_loss += loss.item() * images.size(0)
 
                 preds = torch.argmax(outputs, dim=1)
@@ -114,41 +215,73 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
                 val_preds.extend(preds[valid_mask].cpu().numpy())
                 val_labels.extend(labels[valid_mask].cpu().numpy())
 
-        # Metrics
-        train_loss = epoch_train_loss / len(train_loader.dataset)
-        val_loss = epoch_val_loss / len(val_loader.dataset)
 
-        train_f1 = f1_score(train_labels, train_preds, average='weighted')
-        val_f1 = f1_score(val_labels, val_preds, average='weighted', zero_division=0)
-        train_acc = np.mean(np.array(train_labels) == np.array(train_preds))
-        val_acc = np.mean(np.array(val_labels) == np.array(val_preds))
-        iou = jaccard_score(val_labels, val_preds, average='weighted', zero_division=0)
+        with tqdm(total=5, desc="Evaluating", colour="yellow", leave=False) as pbar:
+            # Convert lists to tensors on GPU
+            train_preds_tensor = torch.tensor(train_preds, device=device)
+            train_labels_tensor = torch.tensor(train_labels, device=device)
+            val_preds_tensor = torch.tensor(val_preds, device=device)
+            val_labels_tensor = torch.tensor(val_labels, device=device)
 
-        # Logs
-        train_loss_history.append(train_loss)
-        val_loss_history.append(val_loss)
-        train_f1_history.append(train_f1)
-        val_f1_history.append(val_f1)
-        train_acc_history.append(train_acc)
-        val_acc_history.append(val_acc)
-        iou_history.append(iou)
+            # Metrics
+            train_loss = epoch_train_loss / len(train_loader.dataset)
+            val_loss = epoch_val_loss / len(val_loader.dataset)
+            pbar.update(1);pbar.refresh()
 
-        print(
-            f"\n{color('Epoch', 'bold', 'magenta')} {epoch + 1}/{hyperparams['epochs']} | "
-            f"{color('Train', 'bold', 'cyan')}: "
-            f"{color('loss')} {train_loss:.4f} {color('f1')} {train_f1:.4f} {color('acc')} {train_acc:.2%} | "
-            f"{color('Val', 'bold', 'blue')}: "
-            f"{color('loss', color='blue')} {val_loss:.4f} {color('f1', color='blue')} {val_f1:.4f} "
-            f"{color('acc', color='blue')} {val_acc:.2%} {color('IoU', color='blue')} {iou:.4f}"
-        )
-        num_classes = model.final_conv[-1].out_channels
-        per_class_f1 = f1_score(val_labels, val_preds, average=None, labels=list(range(1, num_classes)), zero_division=0)
-        per_class_names = [f"Class {i}" for i in range(1, num_classes)]
-        print(color("Per-Class F1:", 'bold', 'yellow'))
-        for cls_name, f1 in zip(per_class_names, per_class_f1):
-            print(f"  {cls_name}: {f1:.4f}")
-        print("\n")
+            train_f1 = f1_metric(train_preds_tensor, train_labels_tensor).item()
+            pbar.update(1);pbar.refresh()
 
+            val_f1 = f1_metric(val_preds_tensor, val_labels_tensor).item()
+            pbar.update(1);pbar.refresh()
+
+            iou = iou_metric(val_preds_tensor, val_labels_tensor).item()
+            pbar.update(1);pbar.refresh()
+
+            train_acc = acc_metric(train_preds_tensor, train_labels_tensor).item()
+            val_acc = acc_metric(val_preds_tensor, val_labels_tensor).item()
+            pbar.update(1);pbar.refresh()
+
+            # Logs
+            train_loss_history.append(train_loss)
+            val_loss_history.append(val_loss)
+            train_f1_history.append(train_f1)
+            val_f1_history.append(val_f1)
+            train_acc_history.append(train_acc)
+            val_acc_history.append(val_acc)
+            iou_history.append(iou)
+
+            tqdm.write(
+                f"{color('Epoch', 'bold', 'magenta')} {epoch + 1}/{hyperparams['epochs']} | "
+                f"{color('Train', 'bold', 'cyan')}: "
+                f"{color('loss')} {train_loss:.4f} {color('f1')} {train_f1:.4f} {color('acc')} {train_acc:.2%} | "
+                f"{color('Val', 'bold', 'blue')}: "
+                f"{color('loss', color='blue')} {val_loss:.4f} {color('f1', color='blue')} {val_f1:.4f} "
+                f"{color('acc', color='blue')} {val_acc:.2%} {color('IoU', color='blue')} {iou:.4f}"
+            )
+
+            w = adaptive_loss.normalized_weights
+            tqdm.write(f"Loss Weights → CE: {w[0]:.2f}, Dice: {w[1]:.2f}, Focal: {w[2]:.2f}")
+
+            # Per-class F1 (same as before, just skip if not needed every epoch)
+            per_class_f1 = f1_score(
+                val_labels_tensor.cpu().numpy(),
+                val_preds_tensor.cpu().numpy(),
+                average=None,
+                labels=list(range(1, NUM_CLASSES)),
+                zero_division=0
+            )
+            cls_to_label = {v: k for k, v in label_to_cls.items()}
+            per_class_names = [
+                label_to_text.get(cls_to_label.get(i, -1), f"Class {i}")
+                for i in range(1, NUM_CLASSES)
+            ]
+
+            tqdm.write(color("Classes with lowest F1:", 'bold', 'yellow'))
+            for i, (cls_name, f1) in enumerate(zip(per_class_names, per_class_f1), start=1):
+                if f1 < 0.1:
+                    tqdm.write(f"Cl.{i})  {cls_name}: {f1:.4f}")
+            tqdm.write("")
+            pbar.update(1); pbar.refresh()
 
         if val_f1 > best_f1:
             best_f1 = val_f1
@@ -163,8 +296,8 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
                 f.write(f"LR: {hyperparams['lr']}, Batch Size: {hyperparams['batch_size']}\n")
         else:
             epochs_no_improve += 1
-            if epochs_no_improve >= patience:
-                print(f"Early stopping at epoch {epoch + 1}")
+            if epochs_no_improve >= early_patience:
+                tqdm.write(f"Early stopping at epoch {epoch + 1}")
                 break
 
         with open(log_file, "a") as f:
@@ -229,7 +362,7 @@ def run_hyperparameter_experiment(train_dataset, val_dataset, device):
 
     for lr in learning_rates:
         print(f"\nRunning experiment with LR={lr}")
-        model = UNetResNet(encoder_depth=50, num_classes=10).to(device)
+        model = UNetResNet(encoder_depth=50, num_classes=NUM_CLASSES).to(device)
         hyperparams = {
             'batch_size': 8,
             'lr': lr,
@@ -289,11 +422,16 @@ def visualize_prediction(model, dataset, device, idx=0):
     axs[1].set_title("Ground Truth")
     axs[2].imshow(pred, cmap='tab20')
     axs[2].set_title(f"Prediction\nAcc: {accuracy:.2f}% ({total_valid - num_mismatched}/{total_valid})")
+
+    error_map = (pred != label) * mask
+    axs[2].imshow(error_map, cmap='Reds', alpha=0.5)
+
     for ax in axs:
         ax.axis('off')
     plt.tight_layout()
     plt.savefig("sample_prediction.png")
     plt.show()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or Load UNet Model for Sentinel2 Segmentation")
@@ -318,7 +456,7 @@ if __name__ == "__main__":
         transform=None
     )
 
-    model = UNetResNet(encoder_depth=101, num_classes=10).to(device)
+    model = UNetResNet(encoder_depth=101, num_classes=NUM_CLASSES, dropout_p=0.2).to(device)
 
     if args.load:
         root = tk.Tk()
@@ -343,7 +481,7 @@ if __name__ == "__main__":
 
         default_hyperparams = {
             'batch_size': 8,
-            'lr': 1e-4,
+            'lr': 5e-5,
             'epochs': 30
         }
         metrics = train_model(model, train_dataset, val_dataset, device, default_hyperparams, output_dir=run_dir)
