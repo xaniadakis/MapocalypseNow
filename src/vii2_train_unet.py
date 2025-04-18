@@ -14,34 +14,33 @@ import tkinter as tk
 from tkinter import filedialog
 import argparse
 from tqdm import tqdm
-from torch.cuda.amp import GradScaler, autocast
 from torchmetrics.classification import MulticlassF1Score, MulticlassJaccardIndex, MulticlassAccuracy
-from v_prepare_training_data import Sentinel2Dataset, get_training_augmentations, SPLIT_DIR, label_to_text, \
-    label_to_cls, AUG_PATCH_DIR
-from vi2_sentinel2_unet import UNetResNet, DiceLoss, FocalLoss, AdaptiveLoss
+from v_prepare_training_data import Sentinel2Dataset, get_training_augmentations, PATCH_DIR, SPLIT_DIR, label_to_cls, \
+    label_to_text
+from vi2_sentinel2_unet import UNetResNet, DiceLoss, AdaptiveLoss
 import os
-from torch.utils.data import WeightedRandomSampler
-from collections import Counter
+from torch.utils.data import Subset
+from itertools import cycle
 
 NUM_CLASSES = 9
 PATCH_SIZE = STRIDE = 512
 PATCH_DIR = Path(f"data/patch_dataset_{PATCH_SIZE}_{STRIDE}")
-OVERSAMPLE_MINORITIES = False
+RANDOM_SEED = 42
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # if using multi-GPU
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def color(text, style='bold', color='cyan'):
     styles = {'bold': '1', 'dim': '2', 'normal': '22'}
     colors = {'cyan': '36', 'magenta': '35', 'yellow': '33', 'blue': '34'}
     return f"\033[{styles[style]};{colors[color]}m{text}\033[0m"
-
-def compute_sampler_weights(dataset, minority_classes=[2, 5, 6, 7, 8]):
-    weights = []
-    for id_ in dataset.ids:
-        lbl_path = PATCH_DIR / "labels" / f"label_{id_}.tif"
-        with rasterio.open(lbl_path) as src:
-            lbl = src.read(1)
-        weight = 1.0 + 5.0 * np.isin(lbl, minority_classes).any()
-        weights.append(weight)
-    return weights
 
 def get_pixel_class_distribution(dataset, patch_dir, num_classes, label_to_cls):
     total_counts = np.zeros(num_classes)
@@ -85,13 +84,6 @@ def compute_pixel_based_patch_weights(dataset, patch_dir, label_to_cls, num_clas
 
     return weights
 
-# test-time augmentation
-def tta_predict(model, x):
-    preds = model(x)
-    preds_flipped = model(torch.flip(x, dims=[3]))
-    preds_flipped = torch.flip(preds_flipped, dims=[3])
-    return (preds + preds_flipped) / 2
-
 def train_model(model, train_dataset, val_dataset, device, hyperparams, output_dir, early_patience=3):
     model_path = os.path.join(output_dir, "best_model.pth")
     log_file = os.path.join(output_dir, "training_log.txt")
@@ -100,18 +92,21 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
 
     epochs_no_improve = 0
 
-    patch_weights = compute_pixel_based_patch_weights(train_dataset, PATCH_DIR, label_to_cls, NUM_CLASSES)
+    # Create data loaders
+    # patch_weights = compute_pixel_based_patch_weights(train_dataset, PATCH_DIR, label_to_cls, NUM_CLASSES)
+
+    # max_patches_per_epoch = 32*5  # or any number that fits GPU memory
+
+    g = torch.Generator()
+    g.manual_seed(RANDOM_SEED)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=hyperparams['batch_size'],
-        sampler=(
-            WeightedRandomSampler(patch_weights, len(patch_weights), replacement=True)
-            if OVERSAMPLE_MINORITIES
-            else None
-        ),
-        shuffle=not OVERSAMPLE_MINORITIES,
-        num_workers=4
+        shuffle=True,
+        num_workers=4,
+        worker_init_fn=lambda _: np.random.seed(RANDOM_SEED),
+        generator=g
     )
     val_loader = DataLoader(
         val_dataset,
@@ -120,38 +115,47 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
         num_workers=4
     )
 
+    # print(f"\nTotal training patches available: {len(train_dataset)}")
+    # print(f"Subset of training patches used: {max_patches_per_epoch}\n")
+
+    cls_idx_to_label = {v: k for k, v in label_to_cls.items()}
     dist = get_pixel_class_distribution(train_dataset, PATCH_DIR, NUM_CLASSES, label_to_cls)
-    print("Pixel count per class:", dist.astype(int))
+    total_pixels = dist.sum()
+
+    def format_count(n):
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.2f}M"
+        elif n >= 1_000:
+            return f"{n / 1_000:.1f}K"
+        return str(n)
+
+    # Prepare sorted list
+    stats = []
+    for i, count in enumerate(dist.astype(int)):
+        raw_label = cls_idx_to_label.get(i, i)
+        cls_name = label_to_text.get(raw_label, f"Class {raw_label}")
+        percentage = 100 * count / total_pixels
+        stats.append((percentage, i, cls_name, count))
+
+    stats.sort(reverse=True)
+
+    print("\nClass Distribution:")
+    for percentage, i, cls_name, count in stats:
+        print(f"{cls_name:15} (Cl.{i}): {format_count(count):>7}  ({percentage:5.2f}%)")
+    print("")
+
 
     f1_metric = MulticlassF1Score(num_classes=NUM_CLASSES, average='weighted', ignore_index=0).to(device)
     iou_metric = MulticlassJaccardIndex(num_classes=NUM_CLASSES, average='weighted', ignore_index=0).to(device)
     acc_metric = MulticlassAccuracy(num_classes=NUM_CLASSES, average='micro', ignore_index=0).to(device)
 
-    # Loss and optimizer
-    # criterion = nn.CrossEntropyLoss(ignore_index=0)
-
-    # # increase if you get good IoU but misclassified pixels
-    # ce_weight = 0.2
-    # # increase if segment shapes are off or fragmented
-    # dice_weight = 0.5
-    # # increase if you get high training accuracy but poor generalization
-    # focal_weight = 1 - ce_weight - dice_weight
-    #
-    # # focuses on hard examples
-    # focal_criterion = FocalLoss()
-    # # pixel-wise classification loss, strong baseline, handles class imbalance if ignore_index/weights are used
-
     weights = 1.0 / (dist + 1e-6)  # Avoid div by zero
     weights /= weights.sum()  # Normalize to sum to 1
     class_weights = torch.tensor(weights, dtype=torch.float32).to(device)
-    ce_criterion = nn.CrossEntropyLoss(ignore_index=0, weight=class_weights.to(device))
-    # ce_criterion = nn.CrossEntropyLoss(ignore_index=0)
-    # overlap-based, class-agnostic, good for segmentation accuracy
-    # dice_criterion = DiceLoss()
-    adaptive_loss = AdaptiveLoss(class_weights=class_weights.to(device), num_classes=NUM_CLASSES).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=hyperparams['lr'], weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=2, factor=0.5)
+    adaptive_loss = AdaptiveLoss(class_weights=class_weights.to(device), num_classes=NUM_CLASSES).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=hyperparams['lr'])
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=3, factor=0.5)
 
     # Histories
     best_f1 = 0.0
@@ -163,28 +167,44 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
     val_acc_history = []
     iou_history = []
 
+
+    # # Prepare shuffled index pool
+    # all_indices = list(range(len(train_dataset)))
+    # random.shuffle(all_indices)
+    # index_pointer = 0
+
     for epoch in range(hyperparams['epochs']):
+        # # Refill & reshuffle when all indices have been used
+        # if index_pointer + max_patches_per_epoch > len(all_indices):
+        #     random.shuffle(all_indices)
+        #     index_pointer = 0
+        # subset_indices = all_indices[index_pointer:index_pointer + max_patches_per_epoch]
+        # index_pointer += max_patches_per_epoch
+        # subset_train_dataset = Subset(train_dataset, subset_indices)
+        # train_loader = DataLoader(
+        #     subset_train_dataset,
+        #     batch_size=hyperparams['batch_size'],
+        #     shuffle=True,
+        #     num_workers=4
+        # )
+
         model.train()
         epoch_train_loss = 0.0
         train_preds = []
         train_labels = []
-        # scaler = torch.amp.GradScaler('cuda') # GradScaler()
 
+        # for images, labels, masks in train_loader:
         for images, labels, masks in tqdm(train_loader, desc=f"Train Epoch {epoch + 1}", leave=False, colour="blue"):
             images = images.to(device)
             labels = labels.to(device).long()
             masks = masks.to(device)
 
             optimizer.zero_grad()
-            # with torch.amp.autocast('cuda'): # autocast():
             outputs = model(images)
             # loss = criterion(outputs, labels)
             loss = adaptive_loss(outputs, labels, masks)
             loss.backward()
             optimizer.step()
-            # scaler.scale(loss).backward()
-            # scaler.step(optimizer)
-            # scaler.update()
 
             epoch_train_loss += loss.item() * images.size(0)
 
@@ -192,6 +212,11 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
             valid_mask = masks.bool()
             train_preds.extend(preds[valid_mask].cpu().numpy())
             train_labels.extend(labels[valid_mask].cpu().numpy())
+            del images, labels, masks, outputs, preds, valid_mask, loss
+
+        train_loss = epoch_train_loss / len(train_loader.dataset)
+        # del train_loader
+        torch.cuda.empty_cache()
 
         model.eval()
         epoch_val_loss = 0.0
@@ -199,13 +224,13 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
         val_labels = []
 
         with torch.no_grad():
+            # for images, labels, masks in val_loader:
             for images, labels, masks in tqdm(val_loader, desc=f"Val Epoch {epoch + 1}", leave=False, colour="red"):
                 images = images.to(device)
                 labels = labels.to(device).long()
                 masks = masks.to(device)
 
                 outputs = model(images)
-                # outputs = tta_predict(model, images)
                 # loss = criterion(outputs, labels)
                 loss = adaptive_loss(outputs, labels, masks)
                 epoch_val_loss += loss.item() * images.size(0)
@@ -214,18 +239,18 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
                 valid_mask = masks.bool()
                 val_preds.extend(preds[valid_mask].cpu().numpy())
                 val_labels.extend(labels[valid_mask].cpu().numpy())
+                del images, labels, masks, outputs, preds, valid_mask, loss
 
+        val_loss = epoch_val_loss / len(val_loader.dataset)
+        # del val_loader
+        torch.cuda.empty_cache()
 
-        with tqdm(total=5, desc="Evaluating", colour="yellow", leave=False) as pbar:
+        with tqdm(total=6, desc="Evaluating", colour="yellow", leave=False) as pbar:
             # Convert lists to tensors on GPU
             train_preds_tensor = torch.tensor(train_preds, device=device)
             train_labels_tensor = torch.tensor(train_labels, device=device)
             val_preds_tensor = torch.tensor(val_preds, device=device)
             val_labels_tensor = torch.tensor(val_labels, device=device)
-
-            # Metrics
-            train_loss = epoch_train_loss / len(train_loader.dataset)
-            val_loss = epoch_val_loss / len(val_loader.dataset)
             pbar.update(1);pbar.refresh()
 
             train_f1 = f1_metric(train_preds_tensor, train_labels_tensor).item()
@@ -240,6 +265,8 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
             train_acc = acc_metric(train_preds_tensor, train_labels_tensor).item()
             val_acc = acc_metric(val_preds_tensor, val_labels_tensor).item()
             pbar.update(1);pbar.refresh()
+
+            del train_preds_tensor, train_labels_tensor #, val_preds_tensor, val_labels_tensor
 
             # Logs
             train_loss_history.append(train_loss)
@@ -270,13 +297,16 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
                 labels=list(range(1, NUM_CLASSES)),
                 zero_division=0
             )
+
+            del val_preds_tensor, val_labels_tensor
+
             cls_to_label = {v: k for k, v in label_to_cls.items()}
             per_class_names = [
                 label_to_text.get(cls_to_label.get(i, -1), f"Class {i}")
                 for i in range(1, NUM_CLASSES)
             ]
 
-            tqdm.write(color("Classes with lowest F1:", 'bold', 'yellow'))
+            tqdm.write(color("Classes with lowest val F1:", 'bold', 'yellow'))
             for i, (cls_name, f1) in enumerate(zip(per_class_names, per_class_f1), start=1):
                 if f1 < 0.1:
                     tqdm.write(f"Cl.{i})  {cls_name}: {f1:.4f}")
@@ -290,6 +320,7 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
 
             with open(meta_file, "w") as f:
                 f.write(f"Saved at Epoch: {epoch + 1}\n")
+                f.write(f"Random Seed: {RANDOM_SEED}\n")
                 f.write(f"Val F1: {val_f1:.4f}\n")
                 f.write(f"Val Acc: {val_acc:.4f}\n")
                 f.write(f"IoU: {iou:.4f}\n")
@@ -297,7 +328,7 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= early_patience:
-                tqdm.write(f"Early stopping at epoch {epoch + 1}")
+                print(f"Early stopping at epoch {epoch + 1}")
                 break
 
         with open(log_file, "a") as f:
@@ -313,6 +344,7 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
             f.write("-" * 40 + "\n")
 
         scheduler.step(val_f1)
+        torch.cuda.empty_cache()
 
     # Plot training metrics
     plt.figure(figsize=(14, 5))
@@ -422,22 +454,19 @@ def visualize_prediction(model, dataset, device, idx=0):
     axs[1].set_title("Ground Truth")
     axs[2].imshow(pred, cmap='tab20')
     axs[2].set_title(f"Prediction\nAcc: {accuracy:.2f}% ({total_valid - num_mismatched}/{total_valid})")
-
-    error_map = (pred != label) * mask
-    axs[2].imshow(error_map, cmap='Reds', alpha=0.5)
-
     for ax in axs:
         ax.axis('off')
     plt.tight_layout()
     plt.savefig("sample_prediction.png")
     plt.show()
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or Load UNet Model for Sentinel2 Segmentation")
     parser.add_argument("--load", action="store_true", default=False, help="Load a model checkpoint instead of training")
     parser.add_argument("--n_patches", type=int, default=5, help="Number of random patches to visualize")
     args = parser.parse_args()
+
+    set_seed(RANDOM_SEED)
 
     # Initialize device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -448,15 +477,17 @@ if __name__ == "__main__":
     train_dataset = Sentinel2Dataset(
         split_txt=SPLIT_DIR / "train.txt",
         patch_dir=PATCH_DIR,
-        transform=get_training_augmentations()
+        transform=get_training_augmentations(seed=RANDOM_SEED),
+        downsample_size=256
     )
     val_dataset = Sentinel2Dataset(
         split_txt=SPLIT_DIR / "val.txt",
         patch_dir=PATCH_DIR,
-        transform=None
+        transform=None,
+        downsample_size=256
     )
 
-    model = UNetResNet(encoder_depth=101, num_classes=NUM_CLASSES, dropout_p=0.2).to(device)
+    model = UNetResNet(encoder_depth=101, num_classes=NUM_CLASSES).to(device)
 
     if args.load:
         root = tk.Tk()
@@ -473,18 +504,18 @@ if __name__ == "__main__":
         else:
             exit(1)
     else:
-        print("Training model from scratch...")
-
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_dir = os.path.join("checkpoints", run_id)
         os.makedirs(run_dir, exist_ok=True)
 
         default_hyperparams = {
-            'batch_size': 8,
+            'batch_size': 12,
             'lr': 5e-5,
             'epochs': 30
         }
-        metrics = train_model(model, train_dataset, val_dataset, device, default_hyperparams, output_dir=run_dir)
+        print(f"Training model from scratch with LR: {default_hyperparams['lr']} & batch size: {default_hyperparams['batch_size']} . . .")
+        metrics = train_model(model, train_dataset, val_dataset, device,
+                              default_hyperparams, output_dir=run_dir, early_patience=3)
 
     indices = random.sample(range(len(val_dataset)), 5)
     for idx in indices:

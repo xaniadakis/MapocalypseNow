@@ -6,6 +6,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 PATCH_SIZE = 512
+STRIDE = PATCH_SIZE # // 2
 
 # === Paths ===
 cwd = Path(__file__).resolve().parent
@@ -15,7 +16,7 @@ bands_dir = processed_dir / "merged_bands"
 ref_path = processed_dir / "GBDA24_ex2_ref_data_reprojected.tif"
 
 # Output patch dataset dir
-dataset_dir = data_dir / "patch_dataset"
+dataset_dir = data_dir / f"patch_dataset_{PATCH_SIZE}_{STRIDE}"
 image_dir = dataset_dir / "images"
 label_dir = dataset_dir / "labels"
 mask_dir = dataset_dir / "masks"
@@ -41,7 +42,6 @@ if __name__ == "__main__":
     ref = rasterio.open(ref_path)
     label_colormap = ref.colormap(1) if ref.count == 1 and ref.colorinterp[0].name == "palette" else None
 
-    stride = PATCH_SIZE
     patch_id = 0
 
     with rasterio.open(ref_path) as src:
@@ -50,31 +50,30 @@ if __name__ == "__main__":
         height, width = src.height, src.width
     valid_mask = data != nodata
     patch_count = 0
-    row_count = 0
-    col_count = 0
-    for row_idx, row in enumerate(range(0, height, PATCH_SIZE)):
-        col_valid = 0
-        for col_idx, col in enumerate(range(0, width, PATCH_SIZE)):
+    row_steps = list(range(0, height - PATCH_SIZE + 1, STRIDE))
+    col_steps = list(range(0, width - PATCH_SIZE + 1, STRIDE))
+
+    for row in row_steps:
+        for col in col_steps:
             window = Window(col, row,
                             min(PATCH_SIZE, width - col),
                             min(PATCH_SIZE, height - row))
             patch = valid_mask[
-                int(window.row_off):int(window.row_off + window.height),
-                int(window.col_off):int(window.col_off + window.width)
-            ]
-            if patch.any():
+                    int(window.row_off):int(window.row_off + window.height),
+                    int(window.col_off):int(window.col_off + window.width)
+                    ]
+            if patch.sum() >= 0.1 * PATCH_SIZE * PATCH_SIZE:  # Match the 10% valid pixel threshold
                 patch_count += 1
-                col_valid += 1
-        if col_valid > 0:
-            row_count += 1
-            col_count = max(col_count, col_valid)
+
+    row_count = len(row_steps)
+    col_count = len(col_steps)
     print(f"Total valid patches: {patch_count}")
     print(f"Grid size: {row_count} rows × {col_count} cols")
     num_digits = len(str(patch_count))
 
-    row_steps = list(range(0, H, stride))
-    col_steps = list(range(0, W, stride))
-    print("Creating patches (streamed):")
+    row_steps = list(range(0, H, STRIDE))
+    col_steps = list(range(0, W, STRIDE))
+    print("Creating patches:")
     for row_idx, row in enumerate(tqdm(row_steps, desc="Rows", colour="red")):
         for col_idx, col in enumerate(tqdm(col_steps, desc=f"Cols", leave=False, colour="blue")):
             window = rasterio.windows.Window(
@@ -88,8 +87,10 @@ if __name__ == "__main__":
             lbl_patch = ref.read(1, window=window)
             msk_patch = (lbl_patch != ref_nodata)
 
-            if not msk_patch.any():
-                continue  # all padding, skip
+            # if not msk_patch.any():
+            #     continue  # all padding, skip
+            if msk_patch.sum() < 0.1 * PATCH_SIZE * PATCH_SIZE:  # Skip patches with <10% valid pixels
+                continue
 
             # === Read band data for this window
             band_data = []
@@ -145,4 +146,3 @@ if __name__ == "__main__":
         b.close()
 
     print(f"{patch_id} patches created.")
-

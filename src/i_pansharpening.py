@@ -18,7 +18,12 @@ def brovey_single(pan, band):
 def process_tile(safe_folder, output_base):
     if DEBUG:
         tqdm.write(f"\n[INFO] Processing tile: {safe_folder.name}")
-    img_dir = next(safe_folder.glob("GRANULE/*/IMG_DATA"))
+
+    img_data_dirs = list(safe_folder.glob("GRANULE/*/IMG_DATA"))
+    if not img_data_dirs:
+        raise FileNotFoundError(f"No IMG_DATA found in {safe_folder}")
+    img_dir = img_data_dirs[0]
+
     if DEBUG:
         tqdm.write(f"[INFO] Found IMG_DATA at: {img_dir}")
 

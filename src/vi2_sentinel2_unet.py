@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 from torchvision import models
 from torch.nn import functional as F
-from torchvision.models import ResNet18_Weights, ResNet50_Weights, ResNet101_Weights, ResNet152_Weights
+from torchvision.models import ResNet50_Weights, ResNet101_Weights, ResNet152_Weights, ResNet18_Weights
+
 
 class FocalLoss(nn.Module):
     def __init__(self, gamma=2.0, alpha=0.25):
@@ -49,6 +50,9 @@ class AdaptiveLoss(nn.Module):
 
         self.num_classes = num_classes
         self.normalized_weights = None
+
+        assert class_weights is None or len(class_weights) == num_classes, \
+            f"Length of class_weights ({len(class_weights)}) != num_classes ({num_classes})"
 
     def forward(self, outputs, labels, mask):
         ce = self.ce_loss(outputs, labels)
@@ -142,7 +146,6 @@ class AttentionBlock(nn.Module):
         attn = self.fc(attn)
         return x * attn
 
-
 class DecoderBlock(nn.Module):
     def __init__(self, in_channels, out_channels, dropout_p):
         super().__init__()
@@ -169,10 +172,10 @@ class DecoderBlock(nn.Module):
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         ) if in_channels != out_channels else nn.Identity()
 
+
     def forward(self, x):
         x = self.attn(x)
         return self.block(x) + self.shortcut(x)
-
 
 class UNetResNet(nn.Module):
     def __init__(self, encoder_depth=50, num_classes=10, pretrained=True, dropout_p=0.2):
@@ -219,43 +222,12 @@ class UNetResNet(nn.Module):
         self.encoder.fc = nn.Identity()
 
         # Encoder blocks
-        # TODO: use this if the more goated encoder_layers are not good
-        # self.encoder_layers = nn.ModuleList([
-        #     nn.Sequential(self.encoder.conv1, self.encoder.bn1, self.encoder.relu),
-        #     nn.Sequential(self.encoder.maxpool, self.encoder.layer1),
-        #     self.encoder.layer2,
-        #     self.encoder.layer3,
-        #     self.encoder.layer4
-        # ])
-
         self.encoder_layers = nn.ModuleList([
-            nn.Sequential(
-                self.encoder.conv1,
-                self.encoder.bn1,
-                self.encoder.relu,
-                nn.Dropout2d(0.1)  # Good for initial layer
-            ),
-            nn.Sequential(
-                self.encoder.maxpool,
-                self.encoder.layer1,
-                CBAM(encoder_channels[1]),  # [1] = 64 for ResNet18, 256 for ResNet50+
-                nn.Dropout2d(0.15)  # Slightly higher dropout
-            ),
-            nn.Sequential(
-                self.encoder.layer2,
-                CBAM(encoder_channels[2]),  # [2] = 128/512
-                nn.Dropout2d(0.2)  # Increasing dropout deeper
-            ),
-            nn.Sequential(
-                self.encoder.layer3,
-                CBAM(encoder_channels[3]),  # [3] = 256/1024
-                nn.Dropout2d(0.25)  # Even higher
-            ),
-            nn.Sequential(
-                self.encoder.layer4,
-                CBAM(encoder_channels[4]),  # [4] = 512/2048
-                nn.Dropout2d(0.3)  # Highest dropout at deepest layer
-            )
+            nn.Sequential(self.encoder.conv1, self.encoder.bn1, self.encoder.relu),
+            nn.Sequential(self.encoder.maxpool, self.encoder.layer1),
+            self.encoder.layer2,
+            self.encoder.layer3,
+            self.encoder.layer4
         ])
 
         self.aspp = ASPP(in_channels=encoder_channels[-1], out_channels=encoder_channels[-1])
@@ -276,16 +248,10 @@ class UNetResNet(nn.Module):
             skip_ch = encoder_channels[-(i + 2)]
             out_ch = decoder_channels[i]
             self.decoder_layers.append(
-                DecoderBlock(in_ch + skip_ch, out_ch, dropout_p)
+                DecoderBlock(in_ch + skip_ch, out_ch, dropout_p=dropout_p)
             )
             in_ch = out_ch  # Next decoder layer takes output of previous as input
 
-            # Final convolution
-            # self.final_conv = nn.Sequential(
-            #     nn.Conv2d(decoder_channels[-1], num_classes, kernel_size=1),
-            #     nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-            # )
-            # self.final_conv = nn.Conv2d(decoder_channels[-1], num_classes, kernel_size=1)
             # Store channels for skip connections
             self.encoder_channels = encoder_channels
 
