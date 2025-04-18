@@ -152,21 +152,57 @@ pred_flat = pred_map[valid_mask]
 gt_remapped = np.vectorize(lambda x: label_to_cls.get(x, 0))(gt_flat)
 
 # === Build reverse mapping and filter valid classes ===
+print("Building reverse mapping...")
 cls_to_label = {v: k for k, v in label_to_cls.items() if v != 0}
 valid_model_classes = sorted(cls_to_label.keys())  # e.g. [1, 2, ..., 8]
 target_names = [label_to_text[cls_to_label[i]] for i in valid_model_classes]
 
 # === Filter only valid classes (exclude background = 0) ===
+print("Filtering valid classes...")
 mask_valid = (gt_remapped != 0)
 gt_eval = gt_remapped[mask_valid]
 pred_eval = pred_flat[mask_valid]
 
-# === Confusion Matrix ===
+import matplotlib.ticker as mticker
+
+# === Confusion Matrix with custom value formatting ===
+print("✅ Plotting formatted confusion matrix (K/M suffix)")
 cm = confusion_matrix(gt_eval, pred_eval, labels=valid_model_classes)
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=target_names)
-disp.plot(xticks_rotation=45, cmap="Blues")
+
+disp = ConfusionMatrixDisplay(
+    confusion_matrix=cm,
+    display_labels=target_names
+)
+
+fig, ax = plt.subplots(figsize=(8, 6))
+
+# Format function: K for thousand, M for million
+def format_cm_value(x):
+    if x >= 1_000_000:
+        return f"{x / 1_000_000:.1f}M"
+    elif x >= 1_000:
+        return f"{x / 1_000:.1f}K"
+    else:
+        return str(x)
+
+# Display manually formatted values
+disp.plot(
+    include_values=False,  # we'll annotate manually
+    cmap="Blues",
+    xticks_rotation=45,
+    ax=ax
+)
+
+for i in range(cm.shape[0]):
+    for j in range(cm.shape[1]):
+        ax.text(j, i, format_cm_value(cm[i, j]),
+                ha="center", va="center",
+                color="white" if cm[i, j] > cm.max() / 2 else "black",
+                fontsize=8)
+
 plt.tight_layout()
 plt.show()
+
 
 # === Classification Report ===
 print("\n📄 Classification Report:")

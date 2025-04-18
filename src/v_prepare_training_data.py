@@ -8,9 +8,12 @@ import rasterio
 from matplotlib import pyplot as plt
 from torch.utils.data import Dataset
 import albumentations as A
-from iv_build_images import PATCH_SIZE
 
-PATCH_DIR = Path("data/patch_dataset")
+PATCH_SIZE = STRIDE = 512
+PATCH_DIR = Path(f"data/patch_dataset_{PATCH_SIZE}_{STRIDE}")
+AUG_PATCH_DIR = Path(f"data/augmented_dataset_{PATCH_SIZE}_{STRIDE}")
+AUG_PATCH_DIR.mkdir(parents=True, exist_ok=True)
+
 SPLIT_DIR = PATCH_DIR / "splits"
 SPLIT_DIR.mkdir(parents=True, exist_ok=True)
 cwd = Path(__file__).resolve().parent
@@ -19,7 +22,7 @@ data_dir = cwd.parent / "data"
 processed_dir = data_dir / "processed"
 ref_path = processed_dir / "GBDA24_ex2_ref_data_reprojected.tif"
 
-dataset_dir = data_dir / "patch_dataset"
+dataset_dir = data_dir / f"patch_dataset_{PATCH_SIZE}_{STRIDE}"
 mask_dir = dataset_dir / "masks"
 mask_paths = sorted(mask_dir.glob("mask_*.tif"))
 
@@ -34,9 +37,9 @@ label_to_cls = {
     40: 4,    # Cropland
     50: 5,    # Built-up
     60: 6,    # Bare/sparse vegetation
-    70: 7,    # Snow and ice
-    80: 8,    # Permanent water bodies
-    90: 9,    # Herbaceous wetland
+    # 70: 7,    # Snow and ice
+    80: 7,    # Permanent water bodies
+    90: 8,    # Herbaceous wetland
     # 95: 10,   # Mangroves
     # 100: 11   # Moss and lichen
 }
@@ -48,7 +51,7 @@ label_to_text = {
     40: "Cropland",
     50: "Built-up",
     60: "Bare land",
-    70: "Snow/Ice",
+    # 70: "Snow/Ice",
     80: "Water",
     90: "Wetland",
     # 95: "Mangroves",
@@ -78,7 +81,8 @@ def create_split_files():
     print(f"Total dataset size: {len(train_ids)+len(val_ids)+len(test_ids)} patches.")
 
 class Sentinel2Dataset(Dataset):
-    def __init__(self, split_txt, patch_dir, transform=None, downsample_size=256):
+    def __init__(self, split_txt, patch_dir, transform=None,
+                 downsample_size=None):
         self.patch_dir = Path(patch_dir)
         with open(split_txt) as f:
             self.ids = [line.strip() for line in f]
@@ -93,6 +97,7 @@ class Sentinel2Dataset(Dataset):
         img_path = self.patch_dir / "images" / f"image_{id_}.tif"
         lbl_path = self.patch_dir / "labels" / f"label_{id_}.tif"
         msk_path = self.patch_dir / "masks" / f"mask_{id_}.tif"
+
 
         with rasterio.open(img_path) as src:
             image = src.read().astype(np.float32) / 10000.0
@@ -126,8 +131,17 @@ class Sentinel2Dataset(Dataset):
 
         return image, label, mask
 
-
-def get_training_augmentations():
+def get_training_augmentations(seed=42, means=None, stds=None):
+    if means is None:
+        means = np.array([
+            0.2153, 0.1946, 0.1852, 0.1804, 0.2002, 0.2572, 0.2813,
+            0.2819, 0.1583, 0.1939, 0.1173, 0.1491, 0.1327
+        ])
+    if stds is None:
+        stds = np.array([
+            0.1320, 0.1275, 0.1261, 0.1290, 0.1350, 0.1563, 0.1683,
+            0.1700, 0.1225, 0.1310, 0.1030, 0.1197, 0.1130
+        ])
     return A.Compose([
         # Geometric augmentations
         A.HorizontalFlip(p=0.5),
@@ -148,20 +162,8 @@ def get_training_augmentations():
         A.GaussNoise(std_range=(0.03, 0.1), mean_range=(0.0, 0.0), per_channel=True, p=0.3),
         A.MultiplicativeNoise(multiplier=(0.9, 1.1), per_channel=True, elementwise=True, p=0.3),
         # Optional normalization (if not handled elsewhere)
-        A.Normalize(
-            mean=(
-                0.2153, 0.1946, 0.1852, 0.1804, 0.2002, 0.2572, 0.2813,
-                0.2819, 0.1583, 0.1939, 0.1173, 0.1491, 0.1327
-            ),
-            std=(
-                0.1320, 0.1275, 0.1261, 0.1290, 0.1350, 0.1563, 0.1683,
-                0.1700, 0.1225, 0.1310, 0.1030, 0.1197, 0.1130
-            ),
-            max_pixel_value=1.0
-        )
-        # A.Normalize(mean=(0.1,) * 13, std=(0.05,) * 13, max_pixel_value=1.0)
-        # A.Normalize(mean=(0.0,) * 13, std=(1.0,) * 13, max_pixel_value=1.0)
-    ])
+        A.Normalize(mean=means.tolist(), std=stds.tolist(), max_pixel_value=1.0)
+    ], seed=seed)
 
 from collections import Counter
 
@@ -217,32 +219,7 @@ def plot_all_split_frequencies():
     plt.savefig(assets_dir / "dataset_splits_class_freqs.png")
 
 # ====== MAIN ======
-if __name__ == "__main__":
-    create_split_files()
-
-    train_dataset = Sentinel2Dataset(
-        split_txt=SPLIT_DIR / "train.txt",
-        patch_dir=PATCH_DIR,
-        transform=get_training_augmentations()
-    )
-
-    # code to compute means and stds per band to better handle normalization
-    # sums = np.zeros(13)
-    # sqsums = np.zeros(13)
-    # npixels = 0
-    # print("Computing per-band mean/std over training set...")
-    # for i in range(len(train_dataset)):
-    #     img, _, _ = train_dataset[i]  # img shape: (13, H, W)
-    #     pixels = img.shape[1] * img.shape[2]
-    #     npixels += pixels
-    #
-    #     sums += img.reshape(13, -1).sum(axis=1)
-    #     sqsums += (img.reshape(13, -1) ** 2).sum(axis=1)
-    # means = sums / npixels
-    # stds = np.sqrt((sqsums / npixels) - (means ** 2))
-    # print("Means:", means)
-    # print("Stds: ", stds)
-
+def plot_grid():
     # === Create low-res mask grid plot ===
     print("\nBuilding downsampled mask grid...")
     # Plot whole grid
@@ -273,7 +250,7 @@ if __name__ == "__main__":
     print(f"Total valid patches: {patch_count}")
     print(f"Grid size: {row_count} rows × {col_count} cols")
     # Load and resize masks
-    target_size = 16
+    target_size = 64
     masks = []
     for path in mask_paths:
         with rasterio.open(path) as src:
@@ -331,6 +308,24 @@ if __name__ == "__main__":
     plt.legend(handles=legend_patches, loc="lower center", bbox_to_anchor=(0.5, -0.05), ncol=3)
     plt.tight_layout()
     plt.show()
+
+if __name__ == "__main__":
+    create_split_files()
+
+    print(f"Our dataset dir is {PATCH_DIR}")
+    # Compute band statistics
+    # print("Computing per-band mean/std over training set...")
+    # means, stds = compute_band_stats(SPLIT_DIR / "train.txt", PATCH_DIR)
+    # print("Means:", means)
+    # print("Stds:", stds)
+
+    train_dataset = Sentinel2Dataset(
+        split_txt=SPLIT_DIR / "train.txt",
+        patch_dir=PATCH_DIR,
+        transform=get_training_augmentations()
+    )
+
+    plot_grid()
 
     # === Add after dataset splitting ===
     plot_all_split_frequencies()
