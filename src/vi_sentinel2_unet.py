@@ -201,7 +201,6 @@ class UNetResNet(nn.Module):
         self.encoder.layer4[0].conv2.stride = (1, 1)
         self.encoder.layer4[0].downsample[0].stride = (1, 1)
 
-        # Modify first conv layer to accept 13-channel input
         original_first_conv = self.encoder.conv1
         self.encoder.conv1 = nn.Conv2d(
             13, original_first_conv.out_channels,
@@ -211,17 +210,17 @@ class UNetResNet(nn.Module):
             bias=original_first_conv.bias
         )
 
-        # Initialize weights for new first layer
+        # initialize weights for new first layer
         if pretrained:
             with torch.no_grad():
                 # Average the weights of the original 3 channels across new 13 channels
                 new_weight = original_first_conv.weight.data.mean(dim=1, keepdim=True).expand(-1, 13, -1, -1)
                 self.encoder.conv1.weight.data = new_weight
 
-        # Remove the original fully connected layer
+        # remove the original fully connected layer
         self.encoder.fc = nn.Identity()
 
-        # Encoder blocks
+        # encoder blocks
         self.encoder_layers = nn.ModuleList([
             nn.Sequential(self.encoder.conv1, self.encoder.bn1, self.encoder.relu),
             nn.Sequential(self.encoder.maxpool, self.encoder.layer1),
@@ -238,21 +237,21 @@ class UNetResNet(nn.Module):
         #     for param in layer.parameters():
         #         param.requires_grad = False
 
-        # Decoder blocks
+        # decoder blocks
         decoder_channels = [256, 128, 64, 32]
         self.decoder_layers = nn.ModuleList()
 
-        # Create decoder layers with skip connections
-        in_ch = encoder_channels[-1]  # Start with the last encoder output
+        # create decoder layers with skip connections
+        in_ch = encoder_channels[-1]
         for i in range(len(decoder_channels)):
             skip_ch = encoder_channels[-(i + 2)]
             out_ch = decoder_channels[i]
             self.decoder_layers.append(
                 DecoderBlock(in_ch + skip_ch, out_ch, dropout_p=dropout_p)
             )
-            in_ch = out_ch  # Next decoder layer takes output of previous as input
+            in_ch = out_ch  # next decoder layer takes output of previous as input
 
-            # Store channels for skip connections
+            # store channels for skip connections
             self.encoder_channels = encoder_channels
 
         self.final_conv = nn.Sequential(
@@ -261,7 +260,7 @@ class UNetResNet(nn.Module):
         )
 
     def forward(self, x):
-        # Encoder
+        # encoder
         skip_connections = []
         for i, layer in enumerate(self.encoder_layers):
             x = layer(x)
@@ -269,7 +268,7 @@ class UNetResNet(nn.Module):
                 skip_connections.append(x)
         x = self.aspp(x)
 
-        # Decoder with skip connections (using at least 2 as required)
+        # decoder with skip connections
         for i, decoder in enumerate(self.decoder_layers):
             skip = skip_connections[-i - 1]  # Get corresponding skip connection
             if x.shape[2:] != skip.shape[2:]:

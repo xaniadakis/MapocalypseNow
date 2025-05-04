@@ -8,14 +8,12 @@ from tqdm import tqdm
 PATCH_SIZE = 512
 STRIDE = PATCH_SIZE # // 2
 
-# === Paths ===
 cwd = Path(__file__).resolve().parent
 data_dir = cwd.parent / "data"
 processed_dir = data_dir / "processed"
 bands_dir = processed_dir / "merged_bands"
 ref_path = processed_dir / "GBDA24_ex2_ref_data_reprojected.tif"
 
-# Output patch dataset dir
 dataset_dir = data_dir / f"patch_dataset_{PATCH_SIZE}_{STRIDE}"
 image_dir = dataset_dir / "images"
 label_dir = dataset_dir / "labels"
@@ -25,7 +23,6 @@ if __name__ == "__main__":
     for d in [image_dir, label_dir, mask_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    # === Open label for shape/metadata ===
     with rasterio.open(ref_path) as ref:
         H, W = ref.height, ref.width
         ref_crs = ref.crs
@@ -33,12 +30,10 @@ if __name__ == "__main__":
         ref_nodata = ref.nodata
         ref_meta = ref.meta.copy()
 
-    # === Prepare band file handles ===
     band_ids = ["B01", "B02", "B03", "B04", "B05", "B06", "B07",
                 "B08", "B8A", "B09", "B10", "B11", "B12"]
     band_files = {b: rasterio.open(bands_dir / f"{b}_merged.tif") for b in band_ids}
 
-    # === Prepare label file handle ===
     ref = rasterio.open(ref_path)
     label_colormap = ref.colormap(1) if ref.count == 1 and ref.colorinterp[0].name == "palette" else None
 
@@ -83,16 +78,12 @@ if __name__ == "__main__":
                 height=min(PATCH_SIZE, H - row)
             )
 
-            # === Read label + mask
             lbl_patch = ref.read(1, window=window)
             msk_patch = (lbl_patch != ref_nodata)
 
-            # if not msk_patch.any():
-            #     continue  # all padding, skip
             if msk_patch.sum() < 0.1 * PATCH_SIZE * PATCH_SIZE:  # Skip patches with <10% valid pixels
                 continue
 
-            # === Read band data for this window
             band_data = []
             for b in band_ids:
                 band = band_files[b]
@@ -101,7 +92,7 @@ if __name__ == "__main__":
 
             img_patch = np.stack(band_data, axis=0)
 
-            # === Pad if needed
+            # Pad if needed
             pad_h = PATCH_SIZE - img_patch.shape[1]
             pad_w = PATCH_SIZE - img_patch.shape[2]
 
@@ -110,7 +101,6 @@ if __name__ == "__main__":
                 lbl_patch = np.pad(lbl_patch, ((0, pad_h), (0, pad_w)), constant_values=0)
                 msk_patch = np.pad(msk_patch, ((0, pad_h), (0, pad_w)), constant_values=0)
 
-            # === Save patch
             patch_meta = ref_meta.copy()
             patch_meta.update({
                 "height": PATCH_SIZE,
@@ -119,13 +109,11 @@ if __name__ == "__main__":
                 "crs": ref_crs
             })
 
-            # Save image
             patch_meta.update(count=len(band_ids), dtype=np.uint16)
             img_path = image_dir / f"image_{patch_id:0{num_digits}d}.tif"
             with rasterio.open(img_path, "w", **patch_meta) as dst:
                 dst.write(img_patch.astype(np.uint16))
 
-            # Save label
             patch_meta.update(count=1, dtype=lbl_patch.dtype)
             lbl_path = label_dir / f"label_{patch_id:0{num_digits}d}.tif"
             with rasterio.open(lbl_path, "w", **patch_meta) as dst:
@@ -133,14 +121,12 @@ if __name__ == "__main__":
                 if label_colormap:
                     dst.write_colormap(1, label_colormap)
 
-            # Save mask
             msk_path = mask_dir / f"mask_{patch_id:0{num_digits}d}.tif"
             with rasterio.open(msk_path, "w", **patch_meta) as dst:
                 dst.write(msk_patch.astype(np.uint8), 1)
 
             patch_id += 1
 
-    # === Cleanup ===
     ref.close()
     for b in band_files.values():
         b.close()

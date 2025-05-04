@@ -10,17 +10,14 @@ data_dir = cwd.parent / "data"
 processed_dir = data_dir / "processed"
 tif_path = processed_dir / "GBDA24_ex2_34SEH_ref_data_reprojected.tif"
 
-# Reverse map: model class index → original label
 cls_to_label = {v: k for k, v in label_to_cls.items()}
 
 with rasterio.open(tif_path) as src:
     cmap = src.colormap(1)
 
-# Header
 print(f"{'Model Class':<12} | {'Label':<5} | {'Class Name':<20} | {'RGB':<13} | {'HEX'}")
 print("-" * 70)
 
-# Table rows
 for cls_idx in sorted(cls_to_label.keys()):
     label = cls_to_label[cls_idx]
     name = label_to_text[label]
@@ -36,5 +33,4 @@ for cls_idx in sorted(cls_to_label.keys()):
         rgb_str = "N/A"
         colored_name = f"{name:<20}"
 
-    # Print using aligned uncolored values, but color only the name visually
     print(f"{cls_idx:<12} | {label:<5} | {colored_name} | {rgb_str:<13} | {hex_color}")

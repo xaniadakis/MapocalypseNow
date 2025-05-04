@@ -1,15 +1,11 @@
 from pathlib import Path
-from rasterio.enums import ColorInterp
-from rasterio.io import MemoryFile
-import numpy as np
 import rasterio
 
-# === Paths ===
 cwd = Path(__file__).resolve().parent
 data_dir = cwd.parent / "data"
 processed_dir = data_dir / "processed"
 output_path = processed_dir / "prediction_map.tif"
-grayscale_path = output_path  # your predicted .tif (grayscale)
+grayscale_path = output_path
 ref_path = processed_dir / "GBDA24_ex2_34SEH_ref_data_reprojected.tif"
 colored_output_path = processed_dir / "prediction_map_colored.tif"
 

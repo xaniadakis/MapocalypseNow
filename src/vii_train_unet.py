@@ -92,10 +92,6 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
     plot_path = os.path.join(output_dir, "training_metrics.png")
     epochs_no_improve = 0
 
-    # Create data loaders
-    # patch_weights = compute_pixel_based_patch_weights(train_dataset, PATCH_DIR, label_to_cls, NUM_CLASSES)
-
-    # max_patches_per_epoch = 32*5  # or any number that fits GPU memory
     torch.cuda.empty_cache()
 
     g = torch.Generator()
@@ -116,9 +112,6 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
         num_workers=4
     )
 
-    # print(f"\nTotal training patches available: {len(train_dataset)}")
-    # print(f"Subset of training patches used: {max_patches_per_epoch}\n")
-
     cls_idx_to_label = {v: k for k, v in label_to_cls.items()}
     dist = get_pixel_class_distribution(train_dataset, PATCH_DIR, NUM_CLASSES, label_to_cls)
     total_pixels = dist.sum()
@@ -130,7 +123,6 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
             return f"{n / 1_000:.1f}K"
         return str(n)
 
-    # Prepare sorted list
     stats = []
     for i, count in enumerate(dist.astype(int)):
         raw_label = cls_idx_to_label.get(i, i)
@@ -167,12 +159,6 @@ def train_model(model, train_dataset, val_dataset, device, hyperparams, output_d
     train_acc_history = []
     val_acc_history = []
     iou_history = []
-
-
-    # # Prepare shuffled index pool
-    # all_indices = list(range(len(train_dataset)))
-    # random.shuffle(all_indices)
-    # index_pointer = 0
 
     for epoch in range(hyperparams['epochs']):
         # # Refill & reshuffle when all indices have been used

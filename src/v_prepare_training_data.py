@@ -148,20 +148,20 @@ def get_training_augmentations(seed=42, means=None, stds=None):
         A.VerticalFlip(p=0.3),
         A.RandomRotate90(p=0.3),
         A.Affine(
-            scale=(0.8, 1.2),  # scale_limit=0.2 → 1±0.2
-            translate_percent=(0.1, 0.1),  # shift_limit=0.1
-            rotate=(-15, 15),  # rotate_limit=15
-            shear=(-10, 10),  # optional — adds slight skew
+            scale=(0.8, 1.2),
+            translate_percent=(0.1, 0.1),
+            rotate=(-15, 15),
+            shear=(-10, 10),
             border_mode=cv2.BORDER_CONSTANT,
-            fill=0,  # fill value for image
-            fill_mask=0,  # fill value for masks (if ignored)
+            fill=0,
+            fill_mask=0,
             p=0.4
         ),
         # Radiometric augmentations
         A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
         A.GaussNoise(std_range=(0.03, 0.1), mean_range=(0.0, 0.0), per_channel=True, p=0.3),
         A.MultiplicativeNoise(multiplier=(0.9, 1.1), per_channel=True, elementwise=True, p=0.3),
-        # Optional normalization (if not handled elsewhere)
+        # normalization
         A.Normalize(mean=means.tolist(), std=stds.tolist(), max_pixel_value=1.0)
     ], seed=seed)
 
@@ -190,7 +190,6 @@ def plot_all_split_frequencies():
         total = sum(counts)
         percentages = [100 * c / total for c in counts]
 
-        # reverse_label_mapping = {v: k for k, v in label_to_cls.items() if v != 0}
         reverse_label_mapping = {v: k for k, v in label_to_cls.items()}
         label_names = [label_to_text.get(reverse_label_mapping.get(lbl), f"Class {lbl}") for lbl in labels]
 
@@ -218,11 +217,8 @@ def plot_all_split_frequencies():
     plt.tight_layout()
     plt.savefig(assets_dir / "dataset_splits_class_freqs.png")
 
-# ====== MAIN ======
 def plot_grid():
-    # === Create low-res mask grid plot ===
     print("\nBuilding downsampled mask grid...")
-    # Plot whole grid
     with rasterio.open(ref_path) as src:
         data = src.read(1)
         nodata = src.nodata
@@ -249,7 +245,6 @@ def plot_grid():
             col_count = max(col_count, col_valid)
     print(f"Total valid patches: {patch_count}")
     print(f"Grid size: {row_count} rows × {col_count} cols")
-    # Load and resize masks
     target_size = 64
     masks = []
     for path in mask_paths:
@@ -260,10 +255,8 @@ def plot_grid():
 
     print(f"Rows: {row_count}, Cols: {col_count}")
 
-    # Create canvas
     canvas_rgb = np.zeros((row_count * target_size, col_count * target_size, 3), dtype=np.uint8)
 
-    # Load split IDs
     train_ids = set(open(SPLIT_DIR / "train.txt").read().splitlines())
     val_ids = set(open(SPLIT_DIR / "val.txt").read().splitlines())
     test_ids = set(open(SPLIT_DIR / "test.txt").read().splitlines())
@@ -274,7 +267,6 @@ def plot_grid():
         "test": [52, 168, 83]  # green
     }
 
-    # Place each resized mask into its proper grid cell
     for path_idx, (path, mask) in enumerate(zip(mask_paths, masks)):
         patch_id = path.stem.replace("mask_", "")
         idx = int(patch_id)
@@ -294,7 +286,6 @@ def plot_grid():
         canvas_rgb[r * target_size:(r + 1) * target_size,
         c * target_size:(c + 1) * target_size] = color_mask
 
-    # Show the final grid
     plt.figure(figsize=(10, 10))
     plt.imshow(canvas_rgb)
     plt.title("Split Overlay on Downsampled Mask Grid")
@@ -313,11 +304,6 @@ if __name__ == "__main__":
     create_split_files()
 
     print(f"Our dataset dir is {PATCH_DIR}")
-    # Compute band statistics
-    # print("Computing per-band mean/std over training set...")
-    # means, stds = compute_band_stats(SPLIT_DIR / "train.txt", PATCH_DIR)
-    # print("Means:", means)
-    # print("Stds:", stds)
 
     train_dataset = Sentinel2Dataset(
         split_txt=SPLIT_DIR / "train.txt",
@@ -327,15 +313,4 @@ if __name__ == "__main__":
 
     plot_grid()
 
-    # === Add after dataset splitting ===
     plot_all_split_frequencies()
-
-    # sample = train_dataset[0]
-    # print("Sample loaded:")
-    # print(f"Image shape: {sample[0].shape}, Label shape: {sample[1].shape}, Mask shape: {sample[2].shape}")
-
-    # for i in range(3):
-    #     image, label, _ = train_dataset[0]
-    #     plt.imshow(image[2], cmap="gray")
-    #     plt.title(f"Augmented Sample #{i+1}")
-    #     plt.show()

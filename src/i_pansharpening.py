@@ -71,11 +71,6 @@ def process_tile(safe_folder, output_base):
                 profile = src.profile
             if band_id in brovey_bands:
                 data = brovey_single(b8, data)
-            # transform = rasterio.transform.from_bounds(
-            #     *src.bounds,  # left, bottom, right, top
-            #     width=b8.shape[1],
-            #     height=b8.shape[0]
-            # )
 
             from rasterio.warp import calculate_default_transform
 
@@ -87,13 +82,6 @@ def process_tile(safe_folder, output_base):
                 dst_height=b8.shape[0]
             )
 
-            # profile.update(
-            #     height=b8.shape[0],
-            #     width=b8.shape[1],
-            #     transform=transform,
-            #     dtype=rasterio.uint16,
-            #     count=1
-            # )
             profile.update(
                 height=dst_height,
                 width=dst_width,

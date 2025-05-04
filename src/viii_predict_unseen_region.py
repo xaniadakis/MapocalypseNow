@@ -14,7 +14,6 @@ from vii_train_unet import NUM_CLASSES
 from vi_sentinel2_unet import UNetResNet
 from i_pansharpening import process_tile
 
-# === Paths ===
 cwd = Path(__file__).resolve().parent
 data_dir = cwd.parent / "data"
 safe_tile = data_dir / "S2A_MSIL1C_20210925T092031_N0500_R093_T34SEH_20230118T233535.SAFE"
@@ -34,12 +33,12 @@ bands = ["B01", "B02", "B03", "B04", "B05", "B06", "B07",
 LOAD_PREDICTIONS = True
 
 if not LOAD_PREDICTIONS:
-    # === Step 1: Process SAFE tile ===
-    print("📦 Processing SAFE tile...")
+    # process SAFE tile
+    print("Processing SAFE tile...")
     process_tile(safe_tile, processed_dir)
 
-    # === Step 2: Align and resample reference data ===
-    print("🗺️  Aligning reference data...")
+    # align and resample reference data
+    print("Aligning reference data...")
     with rasterio.open(tile_path / "B02_10m.tif") as ref:
         dst_crs = ref.crs
         dst_transform = ref.transform
@@ -48,7 +47,7 @@ if not LOAD_PREDICTIONS:
 
     with rasterio.open(ref_raw_path) as src:
         src_array = src.read(1)
-        original_colormap = src.colormap(1)  # <-- grab original colormap
+        original_colormap = src.colormap(1)
 
         dst_array = np.zeros((dst_height, dst_width), dtype=src_array.dtype)
 
@@ -75,8 +74,8 @@ if not LOAD_PREDICTIONS:
             dst.write(dst_array, 1)
             dst.write_colormap(1, original_colormap)  # <-- attach colormap
 
-    # === Step 3: Save patches to disk ===
-    print("🧩 Generating disk-based patches...")
+    # save patches to disk
+    print("Generating disk-based patches...")
     PATCH_SIZE = 512
     STRIDE = 512
 
@@ -96,20 +95,19 @@ if not LOAD_PREDICTIONS:
             patch_path = patch_dir / f"patch_{row}_{col}.npy"
             np.save(patch_path, patch)
 
-    # Clean up RAM and VRAM
+    # clean up RAM and VRAM
     del patch
     gc.collect()
     torch.cuda.empty_cache()
 
-    # === Step 4: Load model ===
-    print("🧠 Loading model...")
+    print("Loading model...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = UNetResNet(encoder_depth=101, num_classes=NUM_CLASSES).to(device)
     model.load_state_dict(torch.load(model_ckpt, map_location=device))
     model.eval()
 
-    # === Step 5: Predict from disk patches ===
-    print("🔮 Running prediction from patches...")
+    # predict from disk patches
+    print("Running prediction from patches...")
     pred_map = np.zeros((dst_height, dst_width), dtype=np.uint8)
     patch_paths = sorted(patch_dir.glob("patch_*.npy"))
 
@@ -130,7 +128,7 @@ if not LOAD_PREDICTIONS:
         gc.collect()
         torch.cuda.empty_cache()
 
-    # Save pred_map to disk
+    # save pred_map to disk
     np.save("pred_map.npy", pred_map)
 
     # To load it later
@@ -141,7 +139,7 @@ if not LOAD_PREDICTIONS:
         dst_height, dst_width = ref.height, ref.width
         dst_meta = ref.meta.copy()
 
-    # === Step 6: Save prediction ===
+    # save prediction
     dst_meta.update({
         "count": 1,
         "dtype": "uint8",
@@ -178,7 +176,6 @@ if not LOAD_PREDICTIONS:
     if output_rgb_path.exists():
         output_rgb_path.unlink()
 
-    # === Fix label IDs back to original label values ===
     cls_to_label = {v: k for k, v in label_to_cls.items() if v != 0}
 
     with rasterio.open(output_rgb_path, "w", **meta) as dst:
@@ -198,13 +195,13 @@ if not LOAD_PREDICTIONS:
 
                 dst.write(rgb_tile, window=window)
 
-    print(f"🌈 RGB prediction saved to: {output_rgb_path}")
+    print(f"RGB prediction saved to: {output_rgb_path}")
 else:
     with rasterio.open(output_path) as src:
         pred_map = src.read(1)
 
-# === Step 7: Evaluate ===
-print("📊 Evaluating prediction...")
+
+print("Evaluating prediction...")
 with rasterio.open(ref_aligned_path) as ref:
     gt = ref.read(1)
 
@@ -213,13 +210,13 @@ gt_flat = gt[valid_mask]
 pred_flat = pred_map[valid_mask]
 gt_remapped = np.vectorize(lambda x: label_to_cls.get(x, 0))(gt_flat)
 
-# === Build reverse mapping and filter valid classes ===
+# build reverse mapping and filter valid classes
 print("Building reverse mapping...")
 cls_to_label = {v: k for k, v in label_to_cls.items() if v != 0}
-valid_model_classes = sorted(cls_to_label.keys())  # e.g. [1, 2, ..., 8]
+valid_model_classes = sorted(cls_to_label.keys())
 target_names = [label_to_text[cls_to_label[i]] for i in valid_model_classes]
 
-# === Filter only valid classes (exclude background = 0) ===
+# filter only valid classes
 print("Filtering valid classes...")
 mask_valid = (gt_remapped != 0)
 gt_eval = gt_remapped[mask_valid]
@@ -227,8 +224,8 @@ pred_eval = pred_flat[mask_valid]
 
 import matplotlib.ticker as mticker
 
-# === Confusion Matrix with custom value formatting ===
-print("✅ Plotting formatted confusion matrix (K/M suffix)")
+# confusion matrix with custom value formatting
+print("Plotting formatted confusion matrix")
 cm = confusion_matrix(gt_eval, pred_eval, labels=valid_model_classes)
 
 disp = ConfusionMatrixDisplay(
@@ -238,7 +235,6 @@ disp = ConfusionMatrixDisplay(
 
 fig, ax = plt.subplots(figsize=(8, 6))
 
-# Format function: K for thousand, M for million
 def format_cm_value(x):
     if x >= 1_000_000:
         return f"{x / 1_000_000:.1f}M"
@@ -247,9 +243,8 @@ def format_cm_value(x):
     else:
         return str(x)
 
-# Display manually formatted values
 disp.plot(
-    include_values=False,  # we'll annotate manually
+    include_values=False,
     cmap="Blues",
     xticks_rotation=45,
     ax=ax
@@ -266,8 +261,7 @@ plt.tight_layout()
 plt.show()
 
 
-# === Classification Report ===
-print("\n📄 Classification Report:")
+print("\nClassification Report:")
 print(classification_report(
     gt_eval, pred_eval,
     target_names=target_names,

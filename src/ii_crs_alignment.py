@@ -82,7 +82,7 @@ with rasterio.open(val_tif_path) as src:
             "width": width,
             "height": height,
             'count': src.count,
-            'dtype': src.dtypes[0],  # in case you're working with specific dtype
+            'dtype': src.dtypes[0],
             'nodata': 0
         }
     )

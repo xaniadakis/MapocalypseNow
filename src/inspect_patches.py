@@ -1,15 +1,11 @@
-import random
 from pathlib import Path
 from collections import Counter
 import numpy as np
 import matplotlib.pyplot as plt
-import cv2
 import rasterio
-from rasterio.windows import Window
 from iv_build_images import PATCH_SIZE, STRIDE
 from v_prepare_training_data import Sentinel2Dataset, PATCH_DIR, SPLIT_DIR
 
-# === CONFIG ===
 LANGUAGE = "en"  # change to "en" or "gr"
 
 label_texts = {
@@ -40,7 +36,6 @@ label_texts = {
 }
 label_names = label_texts[LANGUAGE]
 
-# === PATHS ===
 cwd = Path(__file__).resolve().parent
 data_dir = cwd.parent / "data"
 processed_dir = data_dir / "processed"
@@ -49,7 +44,6 @@ mask_dir = dataset_dir / "masks"
 ref_path = processed_dir / "GBDA24_ex2_ref_data_reprojected.tif"
 mask_paths = sorted(mask_dir.glob("mask_*.tif"))
 
-# === Load Dataset ===
 dataset = Sentinel2Dataset(
     split_txt=SPLIT_DIR / "train.txt",
     patch_dir=PATCH_DIR,
@@ -57,7 +51,6 @@ dataset = Sentinel2Dataset(
 )
 
 
-# === Count empty/full/mixed masks ===
 empty = 0
 full = 0
 mixed = 0
@@ -80,8 +73,6 @@ print(f"Empty (all 0): {empty}")
 print(f"Full  (all 1): {full}")
 print(f"Mixed (0 + 1): {mixed}")
 
-
-# === Label Frequency Across Dataset ===
 label_counter = Counter()
 for _, label, mask in dataset:
     valid_label = label[(mask == 1) & (label != 255)]
@@ -96,7 +87,6 @@ for lbl, count in sorted(label_counter.items()):
     label_str = label_names.get(lbl, f"Class {lbl}")
     print(f"{label_str}: {count} pixels ({pct:.2f}%)")
 
-# Plot global distribution
 plt.figure(figsize=(10, 5))
 labels = sorted([lbl for lbl in label_counter if lbl != 255])
 frequencies = [label_counter[lbl] for lbl in labels]
@@ -125,7 +115,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import random
 
-# === Random Patch Visualizations ===
 num_to_show = 30
 indices = random.sample(range(len(dataset)), num_to_show)
 
@@ -142,9 +131,6 @@ for i in indices:
     fig, axes = plt.subplots(2, 2, figsize=(8, 8))
     fig.suptitle(f"Random Patch #{i}", fontsize=10, fontweight='bold')
 
-    # Grid layout: RGB | Label
-    #              Mask | Histogram
-
     plot_data = [
         (rgb, "RGB", None, {}),
         (label, "Label", "tab20", {}),
@@ -157,13 +143,11 @@ for i in indices:
         ax.set_xticks([])
         ax.set_yticks([])
 
-        # Subtle border
         for spine in ax.spines.values():
             spine.set_visible(True)
             spine.set_color("gray")
             spine.set_linewidth(0.8)
 
-    # Histogram (bottom right)
     ax_hist = axes[1][1]
     ax_hist.set_box_aspect(1)
     percentages = 100 * counts / total
@@ -171,8 +155,6 @@ for i in indices:
     bars = ax_hist.bar(class_names, percentages, color='steelblue', edgecolor='black', linewidth=0.6)
 
     ax_hist.set_title("Label Distribution (%)", fontsize=12)
-    # ax_hist.set_xlabel("Class", fontsize=10)
-    # ax_hist.set_ylabel("Percent", fontsize=10)
     ax_hist.grid(axis="y", linestyle="--", alpha=0.4)
     plt.setp(ax_hist.get_xticklabels(), rotation=20, ha="right", fontsize=8)
 
