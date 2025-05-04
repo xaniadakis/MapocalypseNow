@@ -10,8 +10,8 @@ from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classifica
 import gc
 
 from v_prepare_training_data import label_to_cls, label_to_text
-from vii2_train_unet import NUM_CLASSES
-from vi2_sentinel2_unet import UNetResNet
+from vii_train_unet import NUM_CLASSES
+from vi_sentinel2_unet import UNetResNet
 from i_pansharpening import process_tile
 
 # === Paths ===
@@ -24,6 +24,7 @@ ref_raw_path = data_dir / "GBDA24_ex2_34SEH_ref_data.tif"
 ref_aligned_path = processed_dir / "GBDA24_ex2_34SEH_ref_data_reprojected.tif"
 model_ckpt = cwd.parent / "checkpoints/20250416_163639/best_model.pth"
 output_path = processed_dir / "prediction_map.tif"
+output_rgb_path = processed_dir / "prediction_map_rgb.tif"
 patch_dir = processed_dir / "patched_test_tile"
 patch_dir.mkdir(exist_ok=True)
 
@@ -47,6 +48,8 @@ if not LOAD_PREDICTIONS:
 
     with rasterio.open(ref_raw_path) as src:
         src_array = src.read(1)
+        original_colormap = src.colormap(1)  # <-- grab original colormap
+
         dst_array = np.zeros((dst_height, dst_width), dtype=src_array.dtype)
 
         reproject(
@@ -70,6 +73,7 @@ if not LOAD_PREDICTIONS:
 
         with rasterio.open(ref_aligned_path, "w", **out_meta) as dst:
             dst.write(dst_array, 1)
+            dst.write_colormap(1, original_colormap)  # <-- attach colormap
 
     # === Step 3: Save patches to disk ===
     print("🧩 Generating disk-based patches...")
@@ -126,6 +130,17 @@ if not LOAD_PREDICTIONS:
         gc.collect()
         torch.cuda.empty_cache()
 
+    # Save pred_map to disk
+    np.save("pred_map.npy", pred_map)
+
+    # To load it later
+    # pred_map = np.load("pred_map.npy")
+    with rasterio.open(tile_path / "B02_10m.tif") as ref:
+        dst_crs = ref.crs
+        dst_transform = ref.transform
+        dst_height, dst_width = ref.height, ref.width
+        dst_meta = ref.meta.copy()
+
     # === Step 6: Save prediction ===
     dst_meta.update({
         "count": 1,
@@ -135,8 +150,55 @@ if not LOAD_PREDICTIONS:
     })
     with rasterio.open(output_path, "w", **dst_meta) as dst:
         dst.write(pred_map, 1)
-
     print(f"✅ Prediction saved to: {output_path}")
+
+    from tqdm import tqdm
+    from rasterio.windows import Window
+    print("🎨 Saving RGB prediction (fully optimized, windowed)...")
+    with rasterio.open(output_path) as src:
+        pred_profile = src.profile
+        height, width = src.height, src.width
+        pred_map = src.read(1)
+
+    with rasterio.open(ref_aligned_path) as ref:
+        original_colormap = ref.colormap(1)
+    tile_size = 512
+    meta = pred_profile.copy()
+    meta.update({
+        "count": 3,
+        "dtype": "uint8",
+        "driver": "GTiff",
+        "compress": "lzw",
+        "tiled": True,
+        "blockxsize": 512,
+        "blockysize": 512,
+        "interleave": "pixel",
+        "BIGTIFF": "IF_SAFER"
+    })
+    if output_rgb_path.exists():
+        output_rgb_path.unlink()
+
+    # === Fix label IDs back to original label values ===
+    cls_to_label = {v: k for k, v in label_to_cls.items() if v != 0}
+
+    with rasterio.open(output_rgb_path, "w", **meta) as dst:
+        for row in tqdm(range(0, height, tile_size), desc="Rows", colour="cyan"):
+            for col in range(0, width, tile_size):
+                window = Window(col, row,
+                                min(tile_size, width - col),
+                                min(tile_size, height - row))
+                pred_tile = pred_map[row:row + window.height, col:col + window.width]
+                rgb_tile = np.zeros((3, window.height, window.width), dtype='uint8')
+
+                for cls_val, label in cls_to_label.items():
+                    color = original_colormap.get(label, (0, 0, 0))
+                    mask = (pred_tile == cls_val)
+                    for i in range(3):
+                        rgb_tile[i][mask] = color[i]
+
+                dst.write(rgb_tile, window=window)
+
+    print(f"🌈 RGB prediction saved to: {output_rgb_path}")
 else:
     with rasterio.open(output_path) as src:
         pred_map = src.read(1)
